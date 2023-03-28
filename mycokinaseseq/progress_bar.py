@@ -1,6 +1,7 @@
 """
 Contains class for creating a progress bar
 """
+import time
 
 
 class ProgressBar:
@@ -25,7 +26,7 @@ class ProgressBar:
             self.divisions = divisions
         else:
             self.per = per
-            self.divisions = int(self.total/per)
+            self.divisions = int(self.total / per)
 
     def print_bar(self, progress):
         """
@@ -34,23 +35,17 @@ class ProgressBar:
         :return: Nothing
         """
         # Return cursor to start of line
-        print("\r")
+        print("\r", end="")
         completed = int(progress / self.per)
         percent = progress / self.total
         for i in range(completed):
             print(self.complete, end="")
         for i in range(self.divisions - completed):
             print(self.remain, end="")
-        print(f"{percent:.2f}", end="")
+        print(f"{percent * 100:.2f}%", end="")
         if progress == self.total:
             print("\nFinished!")
 
     def inc(self):
         self.progress += 1
         self.print_bar(self.progress)
-
-
-if __name__ == "__main__":
-    p_bar = ProgressBar(total=35, divisions=10)
-    p_bar.print_bar(20)
-

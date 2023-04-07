@@ -1,8 +1,12 @@
 # Imports
 import itertools
+import typing
+import warnings
+from typing import Union, IO
 
 import numpy as np
 import pandas as pd
+import sklearn
 import statsmodels.api as sm
 
 # Local Imports
@@ -11,17 +15,6 @@ from mycokinaseseq import progress_bar
 
 # Stop warnings about chained assignment
 pd.options.mode.chained_assignment = None
-
-
-def interaction_term_repr(term: tuple[str, str]):
-    return f"{term[0]}_{term[1]}"
-
-
-def interaction_term_repr_list(term_list: list[tuple[str, str]]):
-    repr_list = []
-    for term in term_list:
-        repr_list.append(interaction_term_repr(term))
-    return repr_list
 
 
 def multi_comparison_correction(data: pd.DataFrame,
@@ -134,6 +127,8 @@ class KinaseTfModel:
         self.associations = None
         # Array to hold the significant associations, determined during fitting
         self.significant_associations = None
+        # Variable for if the models have intercepts
+        self.intercept = None
 
     def fit(self, compendia: pd.DataFrame,
             significance_level: float = 0.05,
@@ -157,6 +152,8 @@ class KinaseTfModel:
         :param verbose: Whether a verbose output is desired
         :return: None
         """
+        # Add variable for if the model will have an intercept
+        self.intercept = intercept
         # This will be in two stages, the first will find significant associations, the second will find the actual
         # coefficients
         # First, find the associations
@@ -174,13 +171,110 @@ class KinaseTfModel:
                                      regularized=regularized,
                                      **kwargs)
 
-    def predict(self, tf_expression, kinase_expression):
+    def predict_single(self, tf_expression: pd.Series, kinase_expression: pd.Series):
         """
         Method to predict gene expression values based on provided TF and Kinase expression values
         :param tf_expression:
         :param kinase_expression:
         :return: Prediction
             Pandas Series of predictions, index is locus tag, value is the log2(fold-change) expression value
+        """
+        # Check if all the TFs are in the model, drop any that aren't
+        if not set(tf_expression.index).issubset(set(self.model_coefficients.columns)):
+            warnings.warn("Some TFs in provided expression not found in model, removing")
+            # Remove all entries in tf_expression, not in model_coefficients
+            remove_list = list(set(tf_expression.index) - set(self.model_coefficients.columns))
+            # Drop them
+            tf_expression = tf_expression.drop(remove_list)
+        # Check if all the kinases are in the model, drop any that aren't
+        if not set(kinase_expression.index).issubset(set(self.model_coefficients.columns)):
+            warnings.warn("Some kinases in provided expression not found in model, removing")
+            # Remove all entries in kinase_expression, not in model_coefficients
+            remove_list = list(set(kinase_expression.index) - set(self.model_coefficients.columns))
+            # Drop them
+            tf_expression = kinase_expression.drop(remove_list)
+        # Create the pandas series that will be used as input
+        input_series = pd.Series(0, index=self.model_coefficients.columns)
+        # Set the TF expression values
+        input_series[tf_expression.index] = tf_expression
+        # Set the Kinase expression values
+        input_series[kinase_expression.index] = kinase_expression
+        # Now add interaction terms
+        for tf in self.tf_dict.keys():
+            for kinase in self.kinase_dict.keys():
+                if tf in self.kinase_dict[kinase]:
+                    rep = self.interaction_term_repr((kinase, tf))
+                    if rep in input_series.index:
+                        input_series[rep] = float(tf_expression[tf] * tf_expression)
+        # Add term for intercept if needed
+        if self.intercept:
+            input_series["intercept"] = 1.0
+        prediction = pd.Series(np.matmul(self.model_coefficients.fillna(0).to_numpy(),
+                                         input_series.to_numpy()).flatten(),
+                               index=self.model_coefficients.index)
+        return prediction
+
+    def predict(self, tf_expression: pd.DataFrame, kinase_expression: pd.DataFrame):
+        """
+        Predict the gene expression values from
+        :param tf_expression: Dataframe of TF expression, indexed by sample
+        :param kinase_expression: Dataframe of Kinase expression, indexed by sample
+        :return: prediction
+            Dataframe of predicted gene expression, indexed by sample
+        """
+        # Check if all the TFs are in the model
+        if not set(tf_expression.columns).issubset(set(self.model_coefficients.columns)):
+            warnings.warn("Some TFs in provided expression not found in model, removing")
+            # Remove all entries in tf_expression, not in model_coefficients
+            remove_list = list(set(tf_expression.columns) - set(self.model_coefficients.columns))
+            # Drop them
+            tf_expression = tf_expression.drop(remove_list, axis=1)
+        # Check if all the kinases are in the model, drop any that aren't
+        if not set(kinase_expression.columns).issubset(set(self.model_coefficients.columns)):
+            warnings.warn("Some kinases in provided expression not found in model, removing")
+            # Remove all entries in kinase_expression, not in model_coefficients
+            remove_list = list(set(kinase_expression.columns) - set(self.model_coefficients.columns))
+            # Drop them
+            tf_expression = kinase_expression.drop(remove_list, axis=1)
+        # Ensure that tf_expression, and kinase_expression have the same index
+        if not (tf_expression.index == kinase_expression.index).all():
+            warnings.warn("Indices are not identical, finding overall, dropping remainder")
+            # Find intersect
+            intersect = lh.find_intersect(list(tf_expression.index), list(kinase_expression.index))
+            tf_expression = tf_expression.loc[intersect]
+            kinase_expression = kinase_expression.loc[intersect]
+        # Create dataframe for input data
+        input_data = pd.DataFrame(0.,
+                                  index=tf_expression.index,
+                                  columns=self.model_coefficients.columns)
+        # Add the interaction terms
+        for tf in self.tf_dict.keys():
+            for kinase in self.kinase_dict.keys():
+                if tf in self.kinase_dict[kinase]:
+                    rep = f"{kinase}_{tf}"
+                    if rep in input_data.columns:
+                        input_data[rep] = input_data[kinase] * input_data[tf]
+        if self.intercept:
+            input_data["intercept"] = 1.0
+        # predict with model
+        prediction = pd.DataFrame(np.transpose(np.matmul(self.model_coefficients.fillna(0).to_numpy(),
+                                                         np.transpose(input_data.to_numpy()))),
+                                  index=kinase_expression.index, columns=self.model_coefficients.index)
+        return prediction
+
+    # The input dataframes should be indexed by sample
+    def score(self, kinase_expression: pd.DataFrame,
+              tf_expression: pd.DataFrame,
+              gene_expression: pd.DataFrame,
+              metric: typing.Callable) -> pd.DataFrame:
+        """
+        Score the model against the provided data
+        :param metric: Metric to use for scoring
+        :param kinase_expression: Dataframe of kinase expression values
+        :param tf_expression: Dataframe of TF expression values
+        :param gene_expression: Dataframe of gene expression values
+        :return: Scores
+            Dataframe of scores
         """
         pass
 
@@ -251,11 +345,22 @@ class KinaseTfModel:
         # Create the exogenous array with the transcription factors and kinases
         exogenous_array = compendia[tfs + kinases]
         for kinase, tf in interaction_terms:
-            str_rep = interaction_term_repr((kinase, tf))
+            str_rep = self.interaction_term_repr((kinase, tf))
             exogenous_array[str_rep] = exogenous_array[kinase] * exogenous_array[tf]
         if intercept:
             exogenous_array["intercept"] = 1.
         return exogenous_array
+
+    @staticmethod
+    def interaction_term_repr(term: tuple[str, str]):
+        return f"{term[0]}_{term[1]}"
+
+    @staticmethod
+    def interaction_term_repr_list(term_list: list[tuple[str, str]]):
+        repr_list = []
+        for term in term_list:
+            repr_list.append(KinaseTfModel.interaction_term_repr(term))
+        return repr_list
 
     def find_associations(self,
                           compendia: pd.DataFrame,
@@ -362,9 +467,9 @@ class KinaseTfModel:
                 all_interaction_terms_list.append(f"{kinase}_{tf}")
         self.model_coefficients = pd.DataFrame(data=0.,
                                                index=targeted_genes_list,
-                                               columns=list(self.tf_dict.keys()) +
-                                                       list(self.kinase_dict.keys()) +
+                                               columns=list(self.tf_dict.keys()) + list(self.kinase_dict.keys()) +
                                                        all_interaction_terms_list)
+        self.model_coefficients["intercept"]=0.0
         for gene in targeted_genes_list:
             if verbose:
                 # noinspection PyUnboundLocalVariable
@@ -377,7 +482,7 @@ class KinaseTfModel:
                                                                               gene_col="gene",
                                                                               tf_col="TF",
                                                                               kinase_col="kinase")
-            interaction_term_list = interaction_term_repr_list(interaction_terms)
+            interaction_term_list = self.interaction_term_repr_list(interaction_terms)
             exogenous_array = self.create_exogenous_array(compendia=compendia,
                                                           gene=gene,
                                                           interaction_terms=interaction_terms,
@@ -401,15 +506,46 @@ class KinaseTfModel:
             for interaction_term in interaction_term_list:
                 if interaction_term in coefficients.index:
                     self.model_coefficients.at[gene, interaction_term] = coefficients[interaction_term]
+            if intercept:
+                self.model_coefficients.at[gene, "intercept"] = coefficients["intercept"]
         if verbose:
             print("Found Coefficients")
+            print("Finding kinase effect on genes")
 
-    def score(self, kinase_expression, tf_expression, gene_expression):
+    def create_associations_information_df(self) -> pd.DataFrame:
         """
-        Score the model against the provided data
-        :param kinase_expression: Dataframe of kinase expression values
-        :param tf_expression: Dataframe of TF expression values
-        :param gene_expression: Dataframe of gene expression values
-        :return: Scores
-            Dataframe of scores
+        Add additional information about number of TF and Kinase targets, along with
+        :return: associations
+            Dataframe with associations and added information
         """
+        # Get a copy of the significant associations
+        associations = self.significant_associations.copy()
+        # Add information on the effect of
+        associations["effect_on_tf"] = np.sign(associations["tf_coef"]) * np.sign(associations["interaction_coef"])
+        associations["effect_on_gene"] = np.sign(associations["tf_coef"]) * associations["effect_on_tf"]
+        associations["tfs_targeting_gene"] = associations["gene"].apply(
+            lambda g: len(lh.get_unique_list(self.gene_to_tf_dict[g])))
+        associations["kinases_targeting_tf"] = associations["tf"].apply(
+            lambda t: len(lh.get_unique_list(self.tf_kinase_dict[t])))
+        associations["kinases_targeting_tfs_targeting_gene"] = associations["gene"].apply(
+            lambda g: len(lh.get_unique_list(self.gene_to_tf_to_kinase_dict[g])))
+        associations["tf_targets_num_genes"] = associations["TF"].apply(
+            lambda t: len(lh.get_unique_list(self.tf_dict[t])))
+        associations["kinase_targets_num_genes"] = associations["kinase"].apply(
+            lambda k: len(
+                lh.get_unique_list(
+                    lh.find_intersect(
+                        self.kinase_dict[k],
+                        list(self.tf_dict.keys())))))
+        return associations
+
+    def save_associations(self, file_path: Union[IO, str]) -> None:
+        """
+        Save the associations and relevant information to a csv
+        :param file_path: Where to save the csv to
+        :return: None
+        """
+        # get a copy of the significant associations
+        associations = self.create_associations_information_df()
+        # Save the dataframe
+        associations.to_csv(file_path)

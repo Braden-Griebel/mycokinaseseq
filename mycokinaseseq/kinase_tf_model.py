@@ -121,6 +121,11 @@ class KinaseTfModel:
                 self.genes_targeted_by_kinase += self.gene_to_kinase_dict[gene]
             if self.gene_to_tf_to_kinase_dict[gene]:
                 self.genes_targeted_by_tf_targeted_by_kinase += self.gene_to_tf_to_kinase_dict[gene]
+        # Create a list of all the genes which are targeted by at least one tf, which is targeted by a kinase
+        self.targeted_genes = []
+        for key, item in self.gene_to_tf_to_kinase_dict.items():
+            if item:
+                self.targeted_genes.append(key)
         # Array to hold the model coefficients which will be determined during fitting
         self.model_coefficients = None
         # Array to hold the associations, again determined during fitting
@@ -266,22 +271,29 @@ class KinaseTfModel:
     def score(self, kinase_expression: pd.DataFrame,
               tf_expression: pd.DataFrame,
               gene_expression: pd.DataFrame,
-              metric: typing.Callable) -> pd.DataFrame:
+              metric: typing.Callable) -> pd.Series:
         """
         Score the model against the provided data
-        :param metric: Metric to use for scoring
+        :param metric: Metric to use for scoring, function which can take in two Series of values,
+            the first being the true values, the second being the predicted and return a numerical score
         :param kinase_expression: Dataframe of kinase expression values
         :param tf_expression: Dataframe of TF expression values
         :param gene_expression: Dataframe of gene expression values
         :return: Scores
             Dataframe of scores
         """
-        pass
+        predicted_gene_expression = self.predict(tf_expression=tf_expression, kinase_expression=kinase_expression)
+        score_series = pd.Series(index=list(predicted_gene_expression.columns), dtype="Float64")
+        for gene in gene_expression.columns:
+            predicted = predicted_gene_expression[gene]
+            true = gene_expression[gene]
+            score_series[gene] = metric(true, predicted)
+        return score_series
 
     def find_interaction_terms_initial(self, gene):
         """
         Find the interaction terms for the linear model from the target information
-        :param gene:
+        :param gene: Gene to find the interaction terms for
         :return: interaction_terms
             List of (kinase, TF) tuples representing the interaction terms
         """
@@ -380,13 +392,9 @@ class KinaseTfModel:
         :return: associations
             Dataframe with associations
         """
-        # Create a list of genes which are targeted by at least 1 TF (otherwise, the model will have no information)
-        targeted_genes_list = list(filter(lambda x: ((x not in list(self.tf_dict.keys())) and
-                                                     (x not in list(self.kinase_dict.keys()))),
-                                          self.genes_targeted_by_tf))
         if verbose:
             print("Finding Significant Associations")
-            bar = progress_bar.ProgressBar(total=len(targeted_genes_list), divisions=10)
+            bar = progress_bar.ProgressBar(total=len(self.targeted_genes), divisions=10)
         associations_dict = {
             "kinase": [],
             "TF": [],
@@ -399,7 +407,7 @@ class KinaseTfModel:
             "interaction_coef": []
         }
         associations_df_list = []
-        for gene in targeted_genes_list:
+        for gene in self.targeted_genes:
             if verbose:
                 # noinspection PyUnboundLocalVariable
                 bar.inc()
@@ -441,7 +449,7 @@ class KinaseTfModel:
                                 compendia: pd.DataFrame,
                                 intercept: bool = True,
                                 verbose: bool = False,
-                                regularized: bool = False,
+                                regularized: bool = True,
                                 **kwargs):
         """
         Method to find the model coefficients based on significant associations
@@ -453,24 +461,21 @@ class KinaseTfModel:
         :param kwargs: Dict of keyword args to pass to statsmodels fit method
         :return: None
         """
-        # Create a list of genes which are targeted by at least 1 TF (otherwise, the model will have no information)
-        targeted_genes_list = list(filter(lambda x: ((x not in list(self.tf_dict.keys())) and
-                                                     (x not in list(self.kinase_dict.keys()))),
-                                          self.genes_targeted_by_tf))
         if verbose:
             print("Finding Model Coefficients")
-            bar = progress_bar.ProgressBar(total=len(targeted_genes_list), divisions=10)
+            bar = progress_bar.ProgressBar(total=len(self.targeted_genes), divisions=10)
         all_interaction_terms_list = []
         for tf in self.tf_dict.keys():
             kinases = self.tf_kinase_dict[tf]
             for kinase in kinases:
                 all_interaction_terms_list.append(f"{kinase}_{tf}")
         self.model_coefficients = pd.DataFrame(data=0.,
-                                               index=targeted_genes_list,
+                                               index=self.targeted_genes,
                                                columns=list(self.tf_dict.keys()) + list(self.kinase_dict.keys()) +
                                                        all_interaction_terms_list)
-        self.model_coefficients["intercept"]=0.0
-        for gene in targeted_genes_list:
+        if intercept:
+            self.model_coefficients["intercept"] = 0.0
+        for gene in self.targeted_genes:
             if verbose:
                 # noinspection PyUnboundLocalVariable
                 bar.inc()
@@ -510,7 +515,6 @@ class KinaseTfModel:
                 self.model_coefficients.at[gene, "intercept"] = coefficients["intercept"]
         if verbose:
             print("Found Coefficients")
-            print("Finding kinase effect on genes")
 
     def create_associations_information_df(self) -> pd.DataFrame:
         """

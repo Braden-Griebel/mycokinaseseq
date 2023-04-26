@@ -1,12 +1,19 @@
 # Imports
 import itertools
+import json
+import os
 import typing
 import warnings
 from typing import Union, IO
 
+# External library imports
+import networkx as nx
 import numpy as np
 import pandas as pd
-import sklearn
+import scipy.stats
+from scipy.stats import gaussian_kde
+import sklearn.metrics
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, median_absolute_error, roc_auc_score
 import statsmodels.api as sm
 
 # Local Imports
@@ -72,12 +79,27 @@ class KinaseTfModel:
         Initiation Method
         :param kinase_dict: Dictionary of kinase: gene-targets
         :param tf_dict: Dictionary of tf: gene-targets
+        :param gene_list: List of all genes in the compendia
         """
-        # Create variables to store the kinase and TF dicts
-        self.kinase_dict = kinase_dict
-        self.tf_dict = tf_dict
         # Create a list of genes
         self.gene_list = gene_list
+        # Remove any genes not in gene_list from both of the dictionaries
+        filtered_kinase_dict = {}
+        filtered_tf_dict = {}
+        for kinase, gene_list in kinase_dict.items():
+            if kinase not in self.gene_list:
+                continue
+            filtered_genes = [gene for gene in gene_list if gene in self.gene_list]
+            filtered_kinase_dict[kinase] = filtered_genes
+        for tf, gene_list in tf_dict.items():
+            if tf not in self.gene_list:
+                continue
+            filtered_genes = [gene for gene in gene_list if gene in self.gene_list]
+            filtered_tf_dict[tf] = filtered_genes
+        # Create variables to store the kinase and TF dicts
+        self.kinase_dict = filtered_kinase_dict
+        self.tf_dict = filtered_tf_dict
+
         # Create dictionary of tf:kinase
         self.tf_kinase_dict = {}
         # Iterate through the transcription factors
@@ -125,7 +147,11 @@ class KinaseTfModel:
         self.targeted_genes = []
         for key, item in self.gene_to_tf_to_kinase_dict.items():
             if item:
-                self.targeted_genes.append(key)
+                if (key not in list(self.tf_dict.keys())) and (key not in list(self.kinase_dict.keys())):
+                    self.targeted_genes.append(key)
+        # Lists of TFs and Kinases
+        self.tf_list = list(tf_dict.keys())
+        self.kinase_list = list(kinase_dict.keys())
         # Array to hold the model coefficients which will be determined during fitting
         self.model_coefficients = None
         # Array to hold the associations, again determined during fitting
@@ -134,12 +160,14 @@ class KinaseTfModel:
         self.significant_associations = None
         # Variable for if the models have intercepts
         self.intercept = None
+        # Variable for if the model is regularized
+        self.regularized = None
 
     def fit(self, compendia: pd.DataFrame,
             significance_level: float = 0.05,
             multi_comparison_method: str = "bh",
             false_discovery_rate: float = 0.05,
-            regularized: bool = False,
+            regularized: bool = True,
             intercept: bool = True,
             verbose: bool = False,
             **kwargs
@@ -170,6 +198,7 @@ class KinaseTfModel:
                                verbose=verbose)
         # Now fit the model again with the significant associations being used for the interaction terms,
         # with regularization if desired
+        self.regularized = regularized
         self.find_model_coefficients(compendia=compendia,
                                      intercept=intercept,
                                      verbose=verbose,
@@ -248,19 +277,22 @@ class KinaseTfModel:
             intersect = lh.find_intersect(list(tf_expression.index), list(kinase_expression.index))
             tf_expression = tf_expression.loc[intersect]
             kinase_expression = kinase_expression.loc[intersect]
-        # Create dataframe for input data
-        input_data = pd.DataFrame(0.,
-                                  index=tf_expression.index,
-                                  columns=self.model_coefficients.columns)
-        # Add the interaction terms
-        for tf in self.tf_dict.keys():
-            for kinase in self.kinase_dict.keys():
-                if tf in self.kinase_dict[kinase]:
-                    rep = f"{kinase}_{tf}"
-                    if rep in input_data.columns:
-                        input_data[rep] = input_data[kinase] * input_data[tf]
+        # Create a blank input dataframe
+        input_data = pd.DataFrame(0., columns=self.model_coefficients.columns, index=tf_expression.index)
+        # Add the tf expression data to the input data
+        input_data.loc[tf_expression.index, tf_expression.columns] = tf_expression
+        # Add the kinase expression data to the input data
+        input_data.loc[kinase_expression.index, kinase_expression.columns] = kinase_expression
+        # Add in the intercept term if needed
         if self.intercept:
             input_data["intercept"] = 1.0
+        # Add in the interaction terms
+        for tf in self.tf_kinase_dict.keys():
+            for kinase in self.tf_kinase_dict[tf]:
+                representation = self.interaction_term_repr((kinase, tf))
+                input_data[representation] = input_data[kinase] * input_data[tf]
+        # Reorder the input data to make sure it matches the model_coefficients
+        input_data = input_data[self.model_coefficients.columns]
         # predict with model
         prediction = pd.DataFrame(np.transpose(np.matmul(self.model_coefficients.fillna(0).to_numpy(),
                                                          np.transpose(input_data.to_numpy()))),
@@ -271,7 +303,7 @@ class KinaseTfModel:
     def score(self, kinase_expression: pd.DataFrame,
               tf_expression: pd.DataFrame,
               gene_expression: pd.DataFrame,
-              metric: typing.Callable) -> pd.Series:
+              metric: typing.Callable = mean_squared_error) -> pd.Series:
         """
         Score the model against the provided data
         :param metric: Metric to use for scoring, function which can take in two Series of values,
@@ -279,8 +311,8 @@ class KinaseTfModel:
         :param kinase_expression: Dataframe of kinase expression values
         :param tf_expression: Dataframe of TF expression values
         :param gene_expression: Dataframe of gene expression values
-        :return: Scores
-            Dataframe of scores
+        :return: score_series
+            Pandas series of scores
         """
         predicted_gene_expression = self.predict(tf_expression=tf_expression, kinase_expression=kinase_expression)
         score_series = pd.Series(index=list(predicted_gene_expression.columns), dtype="Float64")
@@ -289,6 +321,131 @@ class KinaseTfModel:
             true = gene_expression[gene]
             score_series[gene] = metric(true, predicted)
         return score_series
+
+    def score_classification(self,
+                             kinase_expression: pd.DataFrame,
+                             tf_expression: pd.DataFrame,
+                             gene_expression: pd.DataFrame,
+                             cutoff: float = 1.,
+                             cutoff_method = "simple") -> (pd.Series, pd.Series):
+        """
+        Score the model against the gene expression data, based on classification of gene expression as either
+            over expression, or under expression
+        :param cutoff_method: How to determine which genes are differentially expressed,
+            can be "simple" or "prob"
+            simple uses cutoff as a cutoff value
+            prob uses cutoff as a probability (or proportion)
+        :param kinase_expression: Dataframe of kinase expression values
+        :param tf_expression: Dataframe of TF expression values
+        :param gene_expression: Dataframe of gene expression values
+        :return: score_series
+            Pandas series of scores
+        :param cutoff: Cutoff for over, and under expression
+            if cutoff_method is simple: under expression is defined as less than the negative
+                cutoff, and over expression is defined as greater than the cutoff
+            if cutoff_method is prob: under expression is defined as being in the bottom cutoff-proportion of the data,
+            and over expression is defined as being the top cutoff-proportion of the data
+        :return: (oe_score, ue_scores)
+            Tuple of pandas series containing the roc_auc scores for the classification problem
+        """
+        if cutoff_method.upper() in ["SIMPLE", "S"]:
+            # Binarize the gene expression data, cutting off at the cutoff parameter
+            # Into two dataframes, one for over expression, and one for under expression
+            oe_df = (gene_expression > cutoff)
+            ko_df = (gene_expression < -1 * cutoff)
+        # Convert the gene_expression into a probability dataframe, then use the cutoff proportion to find
+        #   the over and under expressed genes
+        if cutoff_method.upper() in ["PROB", "PROP", "PROBABILITY", "PROPORTION"]:
+            prob_df_true = pd.DataFrame(0, index = gene_expression.index, columns=gene_expression.columns)
+            for gene in prob_df_true.columns:
+                prob_df_true[gene] = self.compute_probabilities(gene_expression[gene], "left")
+            oe_df = (prob_df_true > (1-cutoff))
+            ko_df = (prob_df_true < cutoff)
+        # Create the predicted value dataframe
+        predicted_df = self.predict(tf_expression=tf_expression, kinase_expression=kinase_expression)
+        # Transform the predicted value dataframe,
+        #       First, compute a gaussian kernel for each gene's predictions
+        #       Then calculate the CDF up to that value to get a p value for the over expression case
+        #       Invert this (take 1-value) to get the under expression predictions
+        oe_prob_df = pd.DataFrame(0, index=predicted_df.index, columns=predicted_df.columns)
+        for gene in predicted_df.columns:
+            oe_prob_df[gene] = self.compute_probabilities(predicted_df[gene], "left")
+        ko_prob_df = 1-oe_prob_df
+        # Use sklearn multilabel roc_auc to find the auc value for each gene, for both OE, and UE
+        # Won't work for the cases where there are no examples of overexpression,
+        oe_sum = oe_df.sum()
+        # Find genes where there are no examples of overexpression
+        no_oe_genes = list(oe_sum[oe_sum == 0].index)
+        # Find the genes where there are examples of overexpression
+        oe_genes = list(oe_sum[oe_sum != 0].index)
+        # Score the genes that have at least 1 case of overexpression
+        oe_score = pd.Series(roc_auc_score(oe_df[oe_genes], oe_prob_df[oe_genes], average=None), index=oe_genes)
+        # Add Nones for all the genes that can't be scored
+        no_oe_score = pd.Series(None, index=no_oe_genes, dtype="Float64")
+        # Concatenate the two series to create the final score series
+        oe_score = pd.concat([oe_score, no_oe_score])
+        # Name the series for later concatenation into a dataframe (if using full_score method)
+        oe_score.name = "oe_auc_score"
+        # Find the sum of the ko_df to find cases where there are no examples of under expression, (sum=0)
+        ko_sum = ko_df.sum()
+        # Find all genes where there are no examples of under expression
+        no_ko_genes = list(ko_sum[ko_sum == 0].index)
+        # Find all genes where there are examples of under expression
+        ko_genes = list(ko_sum[ko_sum!=0].index)
+        # Compute the ko_score for the genes where that is defined
+        ko_score = pd.Series(roc_auc_score(ko_df[ko_genes], ko_prob_df[ko_genes], average=None), index=ko_genes)
+        # Add none for all the genes that can't be scored
+        no_ko_score = pd.Series(None, index=no_ko_genes, dtype="Float64")
+        # Concatenate the two series to create the final score series
+        ko_score = pd.concat([ko_score, no_ko_score])
+        # Name the series for the later concatenation into a dataframe (if using full_score method)
+        ko_score.name = "ue_auc_score"
+        # Gather data into dataframe of scores
+        return oe_score, ko_score
+
+    def score_full(self, kinase_expression: pd.DataFrame,
+                   tf_expression: pd.DataFrame,
+                   gene_expression: pd.DataFrame,
+                   metric_list=None,
+                   metric_names=None,
+                   cutoff: float = 1.) -> pd.DataFrame:
+        """
+        Function to score the model, using both regression scores and classification scores
+        :param kinase_expression: Kinase expression values, shape is (samples, kinases)
+        :param tf_expression: TF expression values, shape is (samples, tfs)
+        :param gene_expression: Gene expression values to score against, shape is (samples, genes)
+        :param metric_list: list of metrics for the regression scoring
+        :param metric_names: list of names of the metrics provided in metric list
+        :param cutoff: Cutoff for labelling the gene_expression data for classification scoring
+        :return: score_df
+            Pandas dataframe of scores, shape is (genes, scores)
+        """
+        if metric_list is None:
+            metric_list = [mean_squared_error,
+                           mean_absolute_error,
+                           r2_score,
+                           median_absolute_error]
+            metric_names = ["mean_squared_error",
+                            "mean_absolute_error",
+                            "median_absolute_error",
+                            "r2_score"]
+        if len(metric_list) != len(metric_names):
+            raise ValueError("Length of metric_list and metric_names don't match")
+        scores = []
+        for metric, name in zip(metric_list, metric_names):
+            score = self.score(kinase_expression=kinase_expression,
+                               tf_expression=tf_expression,
+                               gene_expression=gene_expression,
+                               metric=metric)
+            score.name = name
+            scores.append(score)
+        oe_scores, ue_scores = self.score_classification(kinase_expression=kinase_expression,
+                                                         tf_expression=tf_expression,
+                                                         gene_expression=gene_expression,
+                                                         cutoff=cutoff)
+        scores.append(oe_scores)
+        scores.append(ue_scores)
+        return pd.concat(scores, axis=1)
 
     def find_interaction_terms_initial(self, gene):
         """
@@ -432,7 +589,7 @@ class KinaseTfModel:
                 associations_dict["r_squared"].append(results.rsquared),
                 associations_dict["adjusted_r_squared"].append(results.rsquared_adj),
                 associations_dict["tf_coef"].append(results.params[tf]),
-                associations_dict["kinase_coef"].append(results.params[tf]),
+                associations_dict["kinase_coef"].append(results.params[kinase]),
                 associations_dict["interaction_coef"].append(results.params[representation])
             associations_df_list.append(pd.DataFrame(associations_dict))
         self.associations = pd.concat(associations_df_list, axis=0, ignore_index=True)
@@ -452,7 +609,9 @@ class KinaseTfModel:
                                 regularized: bool = True,
                                 **kwargs):
         """
-        Method to find the model coefficients based on significant associations
+        Method to find the model coefficients based on significant associations.
+        NOTE: Can't use refit, or an L1_wt of 0, because both will lead to the coefficients being returned as a ndarray
+        and what TFs and interactions terms the fitted values correspond too can't be recovered
         :param regularized: Whether statsmodels linear regression should be regularized
         :param compendia: RNA seq compendia for fitting the model, in log2(fold-change) form, with genes as columns
             and samples as rows
@@ -461,6 +620,15 @@ class KinaseTfModel:
         :param kwargs: Dict of keyword args to pass to statsmodels fit method
         :return: None
         """
+        # Save whether the model is regularized
+        self.regularized = regularized
+        # Check for L1_wt, and refit
+        if "refit" in kwargs.keys():
+            if kwargs["refit"]:
+                raise ValueError("refit can't be used due to issues with statsmodels return type")
+        if "L1_wt" in kwargs.keys():
+            if kwargs["L1_wt"] == 0 or kwargs["L1_wt"] == 0.:
+                raise ValueError("L1_wt can't be zero due to issues with statsmodels return type")
         if verbose:
             print("Finding Model Coefficients")
             bar = progress_bar.ProgressBar(total=len(self.targeted_genes), divisions=10)
@@ -488,6 +656,7 @@ class KinaseTfModel:
                                                                               tf_col="TF",
                                                                               kinase_col="kinase")
             interaction_term_list = self.interaction_term_repr_list(interaction_terms)
+            # TODO: Change how the model deals with NA entries
             exogenous_array = self.create_exogenous_array(compendia=compendia,
                                                           gene=gene,
                                                           interaction_terms=interaction_terms,
@@ -529,7 +698,7 @@ class KinaseTfModel:
         associations["effect_on_gene"] = np.sign(associations["tf_coef"]) * associations["effect_on_tf"]
         associations["tfs_targeting_gene"] = associations["gene"].apply(
             lambda g: len(lh.get_unique_list(self.gene_to_tf_dict[g])))
-        associations["kinases_targeting_tf"] = associations["tf"].apply(
+        associations["kinases_targeting_tf"] = associations["TF"].apply(
             lambda t: len(lh.get_unique_list(self.tf_kinase_dict[t])))
         associations["kinases_targeting_tfs_targeting_gene"] = associations["gene"].apply(
             lambda g: len(lh.get_unique_list(self.gene_to_tf_to_kinase_dict[g])))
@@ -541,6 +710,24 @@ class KinaseTfModel:
                     lh.find_intersect(
                         self.kinase_dict[k],
                         list(self.tf_dict.keys())))))
+        # If the model is regularized, add the regularized coefficients as well to the associations dataframe
+        if self.regularized:
+            # Add columns to the dataframe to hold the data
+            associations["tf_coefficient_regularized"] = 0.
+            associations["kinase_coefficient_regularized"] = 0.
+            associations["interaction_coefficient_regularized"] = 0.
+            # Iterate through the rows to find entry in the coefficient matrix and add the value to the row
+            for index, series in associations.iterrows():
+                gene = series["gene"]
+                tf = series["TF"]
+                kinase = series["kinase"]
+                interaction_term = self.interaction_term_repr((kinase, tf))
+                tf_coefficient = self.model_coefficients.loc[gene, tf]
+                kinase_coefficient = self.model_coefficients.loc[gene, kinase]
+                interaction_coefficient = self.model_coefficients.loc[gene, interaction_term]
+                associations.loc[index, "tf_coefficient_regularized"] = tf_coefficient
+                associations.loc[index, "kinase_coefficient_regularized"] = kinase_coefficient
+                associations.loc[index, "interaction_coefficient_regularized"] = interaction_coefficient
         return associations
 
     def save_associations(self, file_path: Union[IO, str]) -> None:
@@ -553,3 +740,68 @@ class KinaseTfModel:
         associations = self.create_associations_information_df()
         # Save the dataframe
         associations.to_csv(file_path)
+
+    def create_network_from_associations(self,
+                                         essentiality_df: pd.DataFrame,
+                                         essentiality_col: str) -> nx.DiGraph:
+        """
+        Create a networkx representation of the significant associations
+        :param essentiality_col: Which column to use for the essentiality property of the nodes
+        :param essentiality_df: Dataframe with essentiality information, indexed by gene
+        :return:graph
+            A networkx DiGraph
+        """
+        network = nx.DiGraph()
+        for kinase in self.kinase_dict.keys():
+            network.add_node(kinase, type="Kinase", essential="NA")
+        for tf in self.tf_dict.keys():
+            network.add_node(tf, type="TF", essential="NA")
+        for gene in self.targeted_genes:
+            network.add_node(gene, type="Target_Gene", essential=essentiality_df[essentiality_col])
+        associations = self.create_associations_information_df()
+        for index, series in associations.iterrows():
+            gene = series["gene"]
+            tf = series["TF"]
+            kinase = series["kinase"]
+            network.add_edge(kinase, tf, influence=0)
+            network.add_edge(tf, gene, influence=np.sign(associations.loc[index, "tf_coef"]))
+        return network
+
+    def create_cytoscape_from_associations(self,
+                                           essentiality_df: pd.DataFrame,
+                                           essentiality_col: str,
+                                           outfile: str):
+        """
+        Save the associations as a cytoscape json file (.cyjs)
+        :param essentiality_df: Passed to create_network_from_associations method
+        :param essentiality_col: Passed to create_network_from_associations method
+        :param outfile: File to write the cytoscape data to
+        :return:
+        """
+        network = self.create_network_from_associations(essentiality_df=essentiality_df,
+                                                        essentiality_col=essentiality_col)
+        cyto_network = nx.cytoscape_data(network, name="name", ident="id")
+        with open(outfile, "w") as f:
+            json.dump(cyto_network, f)
+
+    @staticmethod
+    def compute_probabilities(data: pd.Series, direction: str = "over") -> pd.Series:
+        """
+        Function to compute probabilities from regression output
+        :param data: Data to convert
+        :param direction: Which direction the integral should be computed for the CDF,
+            Starting from -inf: [over, left, l] (case insensitive)
+            Going to -inf: [under, right, r] (case insensitive)
+        :return: probabilities
+            Pandas series of the probabilities, same shape as data
+        """
+        dist = gaussian_kde(data)
+        probabilities = pd.Series(0, index=data.index)
+        for sample in data.index:
+            if direction.upper() in ["OVER", "LEFT", "L"]:
+                probabilities[sample] = dist.integrate_box_1d(-np.inf, data[sample])
+            elif direction.upper() in ["UNDER", "RIGHT", "R", "DOWN", "KO"]:
+                probabilities[sample] = dist.integrate_box_1d(data[sample], np.inf)
+            else:
+                raise ValueError("Couldn't interpret direction")
+        return probabilities

@@ -1,7 +1,5 @@
 # Imports
-import itertools
 import json
-import os
 import typing
 import warnings
 from typing import Union, IO
@@ -10,11 +8,11 @@ from typing import Union, IO
 import networkx as nx
 import numpy as np
 import pandas as pd
-import scipy.stats
-from scipy.stats import gaussian_kde
-import sklearn.metrics
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, median_absolute_error, roc_auc_score
 import statsmodels.api as sm
+from scipy.stats import gaussian_kde
+from sklearn.metrics import mean_squared_error, \
+    mean_absolute_error, r2_score, median_absolute_error, \
+    roc_auc_score, balanced_accuracy_score, f1_score, precision_score, recall_score, accuracy_score
 
 # Local Imports
 import mycokinaseseq.list_helper as lh
@@ -66,6 +64,58 @@ def multi_comparison_correction(data: pd.DataFrame,
         corrected_data = ranked_data.loc[ranked_data[p_val_col] < critical_p]
         corrected_data = corrected_data[(original_cols + ["BH_critical_value"])]
         return corrected_data
+
+
+def compute_probabilities(data: pd.Series, direction: str = "over") -> pd.Series:
+    """
+    Function to compute probabilities from regression output
+    :param data: Data to convert
+    :param direction: Which direction the integral should be computed for the CDF,
+        Starting from -inf: [over, left, l] (case insensitive)
+        Going to -inf: [under, right, r] (case insensitive)
+    :return: probabilities
+        Pandas series of the probabilities, same shape as data
+    """
+    dist = gaussian_kde(data)
+    probabilities = pd.Series(0, index=data.index)
+    for sample in data.index:
+        if direction.upper() in ["OVER", "LEFT", "L"]:
+            probabilities[sample] = dist.integrate_box_1d(-np.inf, data[sample])
+        elif direction.upper() in ["UNDER", "RIGHT", "R", "DOWN", "KO"]:
+            probabilities[sample] = dist.integrate_box_1d(data[sample], np.inf)
+        else:
+            raise ValueError("Couldn't interpret direction")
+    return probabilities
+
+
+def df_reduce(df1, df2, func: typing.Callable, axis: int = 1, **kwargs):
+    """
+    Function to take two dataframes, and reduce them
+    :param df1: Pandas dataframe to reduce with df2 using the provided function
+    :param df2: Pandas dataframe, must have same columns and index as df1
+    :param func: Function which takes in two vectors (pandas Series) and returns a float
+    :param axis: Axis to reduce over, 0 for rows, 1 for columns
+    :return: reduced
+        pandas series containing the value for each row or column (depending on axis argument)
+    """
+    # Make sure the index and columns are equal
+    if not df1.index.equals(df2):
+        raise ValueError("Indices are not equal")
+    if not df1.columns.equals(df2):
+        raise ValueError("Columns are not equal")
+    # If the axis is 0, then iterate through the rows, combining each using the provided function
+    if axis == 0:
+        reduced = pd.Series(None, index=df1.index, dtype="Float64")
+        for row in df1.index:
+            reduced[row] = func(df1.loc[row], df2.loc[row])
+    # If the axis is 1, then iterate through the columns, combining each using the provided function
+    elif axis == 1:
+        reduced = pd.Series(None, index=df1.columns, dtype="Float64")
+        for col in df1.columns:
+            reduced[col] = func(df1[col], df2[col], **kwargs)
+    else:
+        reduced = None
+    return reduced
 
 
 # A class which can take in an RNA seq compendia in log2(fold-change) form,
@@ -299,153 +349,603 @@ class KinaseTfModel:
                                   index=kinase_expression.index, columns=self.model_coefficients.index)
         return prediction
 
-    # The input dataframes should be indexed by sample
-    def score(self, kinase_expression: pd.DataFrame,
-              tf_expression: pd.DataFrame,
-              gene_expression: pd.DataFrame,
-              metric: typing.Callable = mean_squared_error) -> pd.Series:
+    def _setup_score_functions(self, kinase_expression: pd.DataFrame,
+                               tf_expression: pd.DataFrame,
+                               gene_expression: pd.DataFrame) -> (pd.DataFrame, pd.DataFrame):
         """
-        Score the model against the provided data
-        :param metric: Metric to use for scoring, function which can take in two Series of values,
-            the first being the true values, the second being the predicted and return a numerical score
-        :param kinase_expression: Dataframe of kinase expression values
-        :param tf_expression: Dataframe of TF expression values
-        :param gene_expression: Dataframe of gene expression values
-        :return: score_series
-            Pandas series of scores
+        Function to set up for the various score functions
+        :param kinase_expression: Kinase expression values
+        :param tf_expression: Transcription factor expression values
+        :param gene_expression: Gene expression values
+        :return: (gene_expression, predicted_expression)
+            Tuple of pandas dataframes, the first representing the gene expression, the second representing the
+            predicted expression
         """
-        predicted_gene_expression = self.predict(tf_expression=tf_expression, kinase_expression=kinase_expression)
-        score_series = pd.Series(index=list(predicted_gene_expression.columns), dtype="Float64")
-        for gene in gene_expression.columns:
-            predicted = predicted_gene_expression[gene]
-            true = gene_expression[gene]
-            score_series[gene] = metric(true, predicted)
-        return score_series
+        # First, check that all expression dataframes have the same samples
+        samples = gene_expression.index
+        # Replace all NA values with zeroes
+        tf_expression = tf_expression.fillna(0)
+        kinase_expression = kinase_expression.fillna(0)
+        if not kinase_expression.index.equals(samples):
+            raise ValueError("Kinase expression has different samples than gene expression")
+        if not tf_expression.index.equals(samples):
+            raise ValueError("TF expression has different samples than gene expression")
+        # Compute the predicted values
+        predicted = self.predict(tf_expression=tf_expression, kinase_expression=kinase_expression)
+        # Check if gene_expression contains all predicted genes, if it does then take the subset of the predicted
+        #   dataframe to ensure that the predicted dataframe has the same columns as the gene expression dataframe
+        if not set(predicted.columns).issubset(set(gene_expression.columns)):
+            raise ValueError("Gene expression dataframe doesn't include all predicted genes")
+        gene_expression = gene_expression[predicted.columns]
+        return gene_expression, predicted
 
-    def score_classification(self,
-                             kinase_expression: pd.DataFrame,
-                             tf_expression: pd.DataFrame,
-                             gene_expression: pd.DataFrame,
-                             cutoff: float = 1.,
-                             cutoff_method = "simple") -> (pd.Series, pd.Series):
+    def score_gene_regression(self,
+                              kinase_expression: pd.DataFrame,
+                              tf_expression: pd.DataFrame,
+                              gene_expression: pd.DataFrame,
+                              metric: typing.Callable,
+                              **kwargs) -> pd.Series:
         """
-        Score the model against the gene expression data, based on classification of gene expression as either
-            over expression, or under expression
-        :param cutoff_method: How to determine which genes are differentially expressed,
-            can be "simple" or "prob"
-            simple uses cutoff as a cutoff value
-            prob uses cutoff as a probability (or proportion)
-        :param kinase_expression: Dataframe of kinase expression values
-        :param tf_expression: Dataframe of TF expression values
-        :param gene_expression: Dataframe of gene expression values
-        :return: score_series
-            Pandas series of scores
-        :param cutoff: Cutoff for over, and under expression
-            if cutoff_method is simple: under expression is defined as less than the negative
-                cutoff, and over expression is defined as greater than the cutoff
-            if cutoff_method is prob: under expression is defined as being in the bottom cutoff-proportion of the data,
-            and over expression is defined as being the top cutoff-proportion of the data
-        :return: (oe_score, ue_scores)
-            Tuple of pandas series containing the roc_auc scores for the classification problem
+        Function to score the regression model using the provided metric, returns a score for each gene
+        :param kinase_expression: Expression values of the kinases, dimensions are (n_samples, n_kinases)
+        :param tf_expression: Expression values of the transcription factors, dimensions are (n_samples, n_tfs)
+        :param gene_expression: Expression values of the targeted genes, dimensions are (n_samples, genes)
+        :param metric: Metric to use for scoring, should take two pandas series and return a Float64
+        :param kwargs: Key word arguments passed to metric
+        :return: regression_gene_scores
+            Pandas series indexed by gene, with values representing the score for each gene model
         """
-        if cutoff_method.upper() in ["SIMPLE", "S"]:
-            # Binarize the gene expression data, cutting off at the cutoff parameter
-            # Into two dataframes, one for over expression, and one for under expression
-            oe_df = (gene_expression > cutoff)
-            ko_df = (gene_expression < -1 * cutoff)
-        # Convert the gene_expression into a probability dataframe, then use the cutoff proportion to find
-        #   the over and under expressed genes
-        if cutoff_method.upper() in ["PROB", "PROP", "PROBABILITY", "PROPORTION"]:
-            prob_df_true = pd.DataFrame(0, index = gene_expression.index, columns=gene_expression.columns)
-            for gene in prob_df_true.columns:
-                prob_df_true[gene] = self.compute_probabilities(gene_expression[gene], "left")
-            oe_df = (prob_df_true > (1-cutoff))
-            ko_df = (prob_df_true < cutoff)
-        # Create the predicted value dataframe
-        predicted_df = self.predict(tf_expression=tf_expression, kinase_expression=kinase_expression)
-        # Transform the predicted value dataframe,
-        #       First, compute a gaussian kernel for each gene's predictions
-        #       Then calculate the CDF up to that value to get a p value for the over expression case
-        #       Invert this (take 1-value) to get the under expression predictions
-        oe_prob_df = pd.DataFrame(0, index=predicted_df.index, columns=predicted_df.columns)
-        for gene in predicted_df.columns:
-            oe_prob_df[gene] = self.compute_probabilities(predicted_df[gene], "left")
-        ko_prob_df = 1-oe_prob_df
-        # Use sklearn multilabel roc_auc to find the auc value for each gene, for both OE, and UE
-        # Won't work for the cases where there are no examples of overexpression,
-        oe_sum = oe_df.sum()
-        # Find genes where there are no examples of overexpression
-        no_oe_genes = list(oe_sum[oe_sum == 0].index)
-        # Find the genes where there are examples of overexpression
-        oe_genes = list(oe_sum[oe_sum != 0].index)
-        # Score the genes that have at least 1 case of overexpression
-        oe_score = pd.Series(roc_auc_score(oe_df[oe_genes], oe_prob_df[oe_genes], average=None), index=oe_genes)
-        # Add Nones for all the genes that can't be scored
-        no_oe_score = pd.Series(None, index=no_oe_genes, dtype="Float64")
-        # Concatenate the two series to create the final score series
-        oe_score = pd.concat([oe_score, no_oe_score])
-        # Name the series for later concatenation into a dataframe (if using full_score method)
-        oe_score.name = "oe_auc_score"
-        # Find the sum of the ko_df to find cases where there are no examples of under expression, (sum=0)
-        ko_sum = ko_df.sum()
-        # Find all genes where there are no examples of under expression
-        no_ko_genes = list(ko_sum[ko_sum == 0].index)
-        # Find all genes where there are examples of under expression
-        ko_genes = list(ko_sum[ko_sum!=0].index)
-        # Compute the ko_score for the genes where that is defined
-        ko_score = pd.Series(roc_auc_score(ko_df[ko_genes], ko_prob_df[ko_genes], average=None), index=ko_genes)
-        # Add none for all the genes that can't be scored
-        no_ko_score = pd.Series(None, index=no_ko_genes, dtype="Float64")
-        # Concatenate the two series to create the final score series
-        ko_score = pd.concat([ko_score, no_ko_score])
-        # Name the series for the later concatenation into a dataframe (if using full_score method)
-        ko_score.name = "ue_auc_score"
-        # Gather data into dataframe of scores
-        return oe_score, ko_score
+        # Call setup to check index and columns, and make sure the gene_expression and prediction have the same columns
+        gene_expression, predicted = self._setup_score_functions(kinase_expression=kinase_expression,
+                                                                 tf_expression=tf_expression,
+                                                                 gene_expression=gene_expression)
+        regression_gene_scores = df_reduce(gene_expression, predicted, metric, axis=1, **kwargs)
+        return regression_gene_scores
 
-    def score_full(self, kinase_expression: pd.DataFrame,
+    def score_gene_classification_labels(self,
+                                         kinase_expression: pd.DataFrame,
+                                         tf_expression: pd.DataFrame,
+                                         gene_expression: pd.DataFrame,
+                                         cutoff: float = 1.,
+                                         cutoff_method: str = "simple",
+                                         metric: typing.Callable = f1_score,
+                                         **kwargs) -> (pd.Series, pd.Series):
+        """
+        Function to score the model gene-by-gene based on classification
+        :param kinase_expression: Expression values of the kinases, dimensions are (n_samples, n_kinases)
+        :param tf_expression: Expression values of the transcription factors, dimensions are (n_samples, n_tfs)
+        :param gene_expression: Expression values of the targeted genes, dimensions are (n_samples, genes)
+        :param cutoff: Value for cutoff, either an expression level, or probability depending on cutoff method
+        :param cutoff_method: How to perform binarization, either
+            "simple" for considering over expression to be any value greater than cutoff and under expression to be
+                any value below negative cutoff
+            "probability" for considering over expression to be any value in the top cutoff proportion of the data,
+                and under expression to be any value in the bottom cutoff proportion of the data
+        :param metric: Metric to compute, should take two pandas series, and return a score (true is first parameter,
+            predicted is the second parameter). Both will correspond to labels.
+        :param kwargs: Key word arguments passed to metric function
+        :return: oe_scores, ue_scores
+            Pandas dataframes representing the over expression, and under expression scores
+        """
+        # Setup
+        gene_expression, predicted = self._setup_score_functions(kinase_expression=kinase_expression,
+                                                                 tf_expression=tf_expression,
+                                                                 gene_expression=gene_expression)
+        # Perform binarization, for both gene_expression and predicted dataframes
+        if cutoff_method.upper() in ["SIMPLE", "S", "NORMAL"]:
+            oe_true_labels = (gene_expression > cutoff)
+            ue_true_labels = (gene_expression < -1 * cutoff)
+            oe_pred_labels = (predicted > cutoff)
+            ue_pred_labels = (predicted < -1 * cutoff)
+        elif cutoff_method.upper() in ["PROB", "PROP", "PROBABILITY", "PROPORTION", "S"]:
+            probability_true = pd.DataFrame(None, index=gene_expression.index, columns=gene_expression.columns)
+            probability_pred = pd.DataFrame(None, index=predicted.index, columns=predicted.columns)
+            for gene in gene_expression.columns:
+                probability_true = compute_probabilities(gene_expression[gene], direction="left")
+                probability_pred = compute_probabilities(predicted[gene], direction="left")
+            oe_true_labels = (probability_true > 1 - cutoff)
+            ue_true_labels = (probability_true < cutoff)
+            oe_pred_labels = (probability_pred > 1 - cutoff)
+            ue_pred_labels = (probability_pred < cutoff)
+        else:
+            raise ValueError("Couldn't interpret cutoff method")
+        oe_scores = df_reduce(oe_true_labels, oe_pred_labels, func=metric, axis=1, **kwargs)
+        ue_scores = df_reduce(ue_true_labels, ue_pred_labels, func=metric, axis=1, **kwargs)
+        return oe_scores, ue_scores
+
+    def score_gene_classification_decision_function(self,
+                                                    kinase_expression: pd.DataFrame,
+                                                    tf_expression: pd.DataFrame,
+                                                    gene_expression: pd.DataFrame,
+                                                    cutoff: float = 1.,
+                                                    cutoff_method: str = "simple",
+                                                    metric: typing.Callable = roc_auc_score,
+                                                    **kwargs):
+        """
+        Function to score the model gene-by-gene based on classification
+        :param kinase_expression: Expression values of the kinases, dimensions are (n_samples, n_kinases)
+        :param tf_expression: Expression values of the transcription factors, dimensions are (n_samples, n_tfs)
+        :param gene_expression: Expression values of the targeted genes, dimensions are (n_samples, genes)
+        :param cutoff: Value for cutoff, either an expression level, or probability depending on cutoff method
+        :param cutoff_method: How to perform binarization, either
+            "simple" for considering over expression to be any value greater than cutoff and under expression to be
+                any value below negative cutoff
+            "probability" for considering over expression to be any value in the top cutoff proportion of the data,
+                and under expression to be any value in the bottom cutoff proportion of the data
+        :param metric: Metric to compute, should take two pandas series, and return a score (true is first parameter,
+            predicted is the second parameter). True will be boolean labels, while predicted will be the values
+            of the decision function.
+        :param kwargs: keyword arguments passed to metric
+        :return: oe_scores, ue_scores
+            Pandas dataframes representing the over expression, and under expression scores
+        """
+        # Setup
+        gene_expression, predicted = self._setup_score_functions(kinase_expression=kinase_expression,
+                                                                 tf_expression=tf_expression,
+                                                                 gene_expression=gene_expression)
+        # Perform binarization for gene_expression
+        if cutoff_method.upper() in ["SIMPLE", "S", "NORMAL"]:
+            oe_true_labels = (gene_expression > cutoff)
+            ue_true_labels = (gene_expression < -1 * cutoff)
+        elif cutoff_method.upper() in ["PROB", "PROP", "PROBABILITY", "PROPORTION", "S"]:
+            probability_true = pd.DataFrame(None, index=gene_expression.index, columns=gene_expression.columns)
+            for gene in gene_expression.columns:
+                probability_true = compute_probabilities(gene_expression[gene], direction="left")
+            oe_true_labels = (probability_true > 1 - cutoff)
+            ue_true_labels = (probability_true < cutoff)
+        else:
+            raise ValueError("Couldn't Interpret Cutoff Method")
+        oe_scores = df_reduce(oe_true_labels, predicted, func=metric, axis=1, **kwargs)
+        ue_scores = df_reduce(ue_true_labels, -1 * predicted, func=metric, axis=1, **kwargs)
+        return oe_scores, ue_scores
+
+    def score_overall_regression(self,
+                                 kinase_expression: pd.DataFrame,
+                                 tf_expression: pd.DataFrame,
+                                 gene_expression: pd.DataFrame,
+                                 metric: typing.Callable,
+                                 **kwargs) -> float:
+        """
+        Function to score the regression model using the provided metric, returns an overall score
+        :param kinase_expression: Expression values of the kinases, dimensions are (n_samples, n_kinases)
+        :param tf_expression: Expression values of the transcription factors, dimensions are (n_samples, n_tfs)
+        :param gene_expression: Expression values of the targeted genes, dimensions are (n_samples, genes)
+        :param metric: Metric to use for scoring, should take two 1d numpy arrays and return a Float64
+        :param kwargs: key word arguments passed to metric
+        :return: score
+            Value for the score across the entire model
+        """
+        # Setup
+        gene_expression, predicted = self._setup_score_functions(kinase_expression=kinase_expression,
+                                                                 tf_expression=tf_expression,
+                                                                 gene_expression=gene_expression)
+        # Make sure the predicted dataframe matches the gene expression data frame
+        predicted = predicted.loc[gene_expression.index, gene_expression.columns]
+        # Flatten the gene_expression, and the predicted dataframes
+        flat_gene_expression = gene_expression.to_numpy().reshape((-1, 1))
+        flat_pred_expression = predicted.to_numpy().reshape((-1, 1))
+        # Score the model and return the result
+        return metric(flat_gene_expression, flat_pred_expression, **kwargs)
+
+    def score_overall_classification_labels(self,
+                                            kinase_expression: pd.DataFrame,
+                                            tf_expression: pd.DataFrame,
+                                            gene_expression: pd.DataFrame,
+                                            cutoff: float = 1.,
+                                            cutoff_method: str = "simple",
+                                            metric: typing.Callable = f1_score,
+                                            **kwargs):
+        """
+        Function to score the model overall based on classification
+        :param kinase_expression: Expression values of the kinases, dimensions are (n_samples, n_kinases)
+        :param tf_expression: Expression values of the transcription factors, dimensions are (n_samples, n_tfs)
+        :param gene_expression: Expression values of the targeted genes, dimensions are (n_samples, genes)
+        :param cutoff: Value for cutoff, either an expression level, or probability depending on cutoff method
+        :param cutoff_method: How to perform binarization, either
+            "simple" for considering over expression to be any value greater than cutoff and under expression to be
+                any value below negative cutoff
+            "probability" for considering over expression to be any value in the top cutoff proportion of the data,
+                and under expression to be any value in the bottom cutoff proportion of the data
+        :param metric: Metric to compute, should take two pandas series, and return a score (true is first parameter,
+            predicted is the second parameter). Both will correspond to labels.
+        :param kwargs: Key word arguments passed to metric function
+        :return: oe_score, ue_score
+            tuple of scores for over expression and under expression
+        """
+        # Setup
+        gene_expression, predicted = self._setup_score_functions(kinase_expression=kinase_expression,
+                                                                 tf_expression=tf_expression,
+                                                                 gene_expression=gene_expression)
+        # Ensure that the predicted dataframe has the same index and columns as the gene_expression, in the same order
+        predicted = predicted.loc[gene_expression.index, gene_expression.columns]
+        # Perform binarization, for both gene_expression and predicted dataframes
+        if cutoff_method.upper() in ["SIMPLE", "S", "NORMAL"]:
+            oe_true_labels = (gene_expression > cutoff)
+            ue_true_labels = (gene_expression < -1 * cutoff)
+            oe_pred_labels = (predicted > cutoff)
+            ue_pred_labels = (predicted < -1 * cutoff)
+        elif cutoff_method.upper() in ["PROB", "PROP", "PROBABILITY", "PROPORTION", "S"]:
+            probability_true = pd.DataFrame(None, index=gene_expression.index, columns=gene_expression.columns)
+            probability_pred = pd.DataFrame(None, index=predicted.index, columns=predicted.columns)
+            for gene in gene_expression.columns:
+                probability_true = compute_probabilities(gene_expression[gene], direction="left")
+                probability_pred = compute_probabilities(predicted[gene], direction="left")
+            oe_true_labels = (probability_true > 1 - cutoff)
+            ue_true_labels = (probability_true < cutoff)
+            oe_pred_labels = (probability_pred > 1 - cutoff)
+            ue_pred_labels = (probability_pred < cutoff)
+        else:
+            raise ValueError("Couldn't Interpret Cutoff Method")
+        # Flatten the arrays
+        flat_oe_true_labels = oe_true_labels.to_numpy().reshape((-1, 1))
+        flat_ue_true_labels = ue_true_labels.to_numpy().reshape((-1, 1))
+        flat_oe_pred_labels = oe_pred_labels.to_numpy().reshape((-1, 1))
+        flat_ue_pred_labels = ue_pred_labels.to_numpy().reshape((-1, 1))
+        # Score the model using the metric
+        oe_score = metric(flat_oe_true_labels, flat_oe_pred_labels, **kwargs)
+        ue_score = metric(flat_ue_true_labels, flat_ue_pred_labels, **kwargs)
+        return oe_score, ue_score
+
+    def score_overall_classification_decision_function(self,
+                                                       kinase_expression: pd.DataFrame,
+                                                       tf_expression: pd.DataFrame,
+                                                       gene_expression: pd.DataFrame,
+                                                       cutoff: float = 1.,
+                                                       cutoff_method: str = "simple",
+                                                       metric: typing.Callable = roc_auc_score,
+                                                       **kwargs):
+        """
+        Function to score the model gene-by-gene based on classification
+        :param kinase_expression: Expression values of the kinases, dimensions are (n_samples, n_kinases)
+        :param tf_expression: Expression values of the transcription factors, dimensions are (n_samples, n_tfs)
+        :param gene_expression: Expression values of the targeted genes, dimensions are (n_samples, genes)
+        :param cutoff: Value for cutoff, either an expression level, or probability depending on cutoff method
+        :param cutoff_method: How to perform binarization, either
+            "simple" for considering over expression to be any value greater than cutoff and under expression to be
+                any value below negative cutoff
+            "probability" for considering over expression to be any value in the top cutoff proportion of the data,
+                and under expression to be any value in the bottom cutoff proportion of the data
+        :param metric: Metric to compute, should take two pandas series, and return a score (true is first parameter,
+            predicted is the second parameter). True will be boolean labels, while predicted will be the values
+            of the decision function.
+        :param kwargs: keyword arguments passed to metric
+        :return: oe_scores, ue_scores
+            Pandas dataframes representing the over expression, and under expression scores
+        """
+        # Setup
+        gene_expression, predicted = self._setup_score_functions(kinase_expression=kinase_expression,
+                                                                 tf_expression=tf_expression,
+                                                                 gene_expression=gene_expression)
+        # Ensure that the predicted dataframe has its index and columns match the gene_expression dataframe
+        predicted = predicted.loc[gene_expression.index, gene_expression.columns]
+        # Perform binarization for gene_expression
+        if cutoff_method.upper() in ["SIMPLE", "S", "NORMAL"]:
+            oe_true_labels = (gene_expression > cutoff)
+            ue_true_labels = (gene_expression < -1 * cutoff)
+        elif cutoff_method.upper() in ["PROB", "PROP", "PROBABILITY", "PROPORTION", "S"]:
+            probability_true = pd.DataFrame(None, index=gene_expression.index, columns=gene_expression.columns)
+            for gene in gene_expression.columns:
+                probability_true = compute_probabilities(gene_expression[gene], direction="left")
+            oe_true_labels = (probability_true > 1 - cutoff)
+            ue_true_labels = (probability_true < cutoff)
+        else:
+            raise ValueError("Couldn't Interpret Cutoff method")
+        # Flatten the dataframes
+        flat_oe_true_labels = oe_true_labels.to_numpy().reshape((-1, 1))
+        flat_ue_true_labels = ue_true_labels.to_numpy().reshape((-1, 1))
+        flat_predicted = predicted.to_numpy().reshape((-1, 1))
+        # Score the model
+        oe_score = metric(flat_oe_true_labels, flat_predicted, **kwargs)
+        ue_score = metric(flat_ue_true_labels, -1 * flat_predicted, **kwargs)
+        return oe_score, ue_score
+
+    def score_restricted(self,
+                         compendia: pd.DataFrame,
+                         intercept: bool = True,
+                         verbose: bool = False,
+                         use_significant_associations: bool = False,
+                         association_kwargs: dict = None,
+                         **kwargs
+                         ):
+        """
+        Function to use restriction F-tests to evaluate the model in comparison to models using only TFs, and
+            models using only kinases
+        :param association_kwargs: keyword arguments to pass to the find_associations method
+        :param use_significant_associations: Whether the significant associations should be used for the full model,
+            or the full model should include all possible interaction terms regardless of their individual significance
+        :param compendia: RNA seq gene expression compendia, in log2(fold-change) form, dimensions are
+            (n_samples, n_targeted_genes+n_kinases+n_tfs),
+        :param intercept: Whether to include an intercept in the model
+        :param verbose: Whether a verbose output is desired
+        :param kwargs: Key word arguments passed to the statsmodels regression model fit method
+        :return: prob_df
+            Pandas dataframe of probabilities from the restricted F-test
+        """
+        if verbose:
+            print("Evaluating restricted models")
+            bar = progress_bar.ProgressBar(total=len(self.targeted_genes), divisions=10)
+        else:
+            bar = None
+        prob_df = pd.DataFrame(0,
+                               index=self.targeted_genes,
+                               columns=["tf_only", "kinase_only", "tf_kinase"])
+        # If the significant associations are the ones that should be used for
+        if use_significant_associations:
+            if verbose:
+                print("Finding significant associations")
+            if not self.significant_associations:
+                if not association_kwargs:
+                    association_kwargs = {
+                        "significance_level": 0.05,
+                        "multi_comparison_method": "bh",
+                        "false_discovery_rate": 0.05,
+                        "intercept": True,
+                        "verbose": verbose
+                    }
+                self.find_associations(compendia, **association_kwargs)
+        # Iterate through the genes, and compute the needed probabilities
+        for gene in self.targeted_genes:
+            if verbose:
+                # noinspection PyUnboundLocalVariables
+                bar.inc()
+            data = compendia.copy()
+            if use_significant_associations:
+                interaction_terms = self.find_interaction_terms_from_associations(gene, self.significant_associations)
+            else:
+                interaction_terms = self.find_interaction_terms_initial(gene)
+            # Create the full model
+            exogenous_array = self.create_exogenous_array(compendia=compendia,
+                                                          gene=gene,
+                                                          interaction_terms=interaction_terms,
+                                                          intercept=intercept).dropna(axis=0)
+            endogenous_array = data[gene].dropna(axis=0)
+            defined_samples = lh.find_intersect(list(exogenous_array.index), list(endogenous_array.index))
+            exogenous_array = exogenous_array.loc[defined_samples]
+            endogenous_array = endogenous_array.loc[defined_samples]
+            full_model = sm.OLS(endog=endogenous_array, exog=exogenous_array)
+            full_results = full_model.fit()
+
+            # Create the tf only model arrays
+            tf_exog = data[self.gene_to_tf_dict[gene]].loc[defined_samples]
+            # Create the tf_only model
+            tf_model = sm.OLS(endog=endogenous_array, exog=tf_exog)
+            tf_results = tf_model.fit(**kwargs)
+
+            # Create the kinase only model arrays
+            kinase_exog = data[self.gene_to_tf_to_kinase_dict[gene]].loc[defined_samples]
+            kinase_model = sm.OLS(endog=endogenous_array, exog=kinase_exog)
+            kinase_results = kinase_model.fit(**kwargs)
+
+            # Create the TF, Kinase Model (not including interaction terms)
+            tf_kinase_exog = data[self.gene_to_tf_dict[gene] + self.gene_to_tf_to_kinase_dict[gene]].loc[
+                defined_samples]
+            tf_kinase_model = sm.OLS(endog=endogenous_array, exog=tf_kinase_exog)
+            tf_kinase_results = tf_kinase_model.fit(**kwargs)
+
+            # Add the results of the compare_f_test to the prob_df
+            prob_df.loc[gene, "tf_only"] = full_results.compare_f_test(tf_results)
+            prob_df.loc[gene, "kinase_only"] = full_results.compare_f_test(kinase_results)
+            prob_df.loc[gene, "tf_kinase"] = full_results.compare_f_test(tf_kinase_results)
+
+        # Return the completed prob_df
+        return prob_df
+
+    def score_full(self,
+                   kinase_expression: pd.DataFrame,
                    tf_expression: pd.DataFrame,
                    gene_expression: pd.DataFrame,
-                   metric_list=None,
-                   metric_names=None,
-                   cutoff: float = 1.) -> pd.DataFrame:
+                   cutoff: float = 1.,
+                   cutoff_method: str = "simple",
+                   regression_metric_list: list = None,
+                   regression_metric_names: list = None,
+                   regression_metric_kwargs: list = None,
+                   classification_labels_metric_list: list = None,
+                   classification_labels_metric_names: list = None,
+                   classification_labels_metric_kwargs: list = None,
+                   classification_decision_function_metric_list: list = None,
+                   classification_decision_function_metric_names: list = None,
+                   classification_decision_function_metric_kwargs: list = None,
+                   ) -> (pd.DataFrame, pd.Series):
         """
-        Function to score the model, using both regression scores and classification scores
-        :param kinase_expression: Kinase expression values, shape is (samples, kinases)
-        :param tf_expression: TF expression values, shape is (samples, tfs)
-        :param gene_expression: Gene expression values to score against, shape is (samples, genes)
-        :param metric_list: list of metrics for the regression scoring
-        :param metric_names: list of names of the metrics provided in metric list
-        :param cutoff: Cutoff for labelling the gene_expression data for classification scoring
-        :return: score_df
-            Pandas dataframe of scores, shape is (genes, scores)
+        Function to score the model gene-by-gene based on classification
+        :param kinase_expression: Expression values of the kinases, dimensions are (n_samples, n_kinases)
+        :param tf_expression: Expression values of the transcription factors, dimensions are (n_samples, n_tfs)
+        :param gene_expression: Expression values of the targeted genes, dimensions are (n_samples, genes)
+        :param cutoff: Value for cutoff, either an expression level, or probability depending on cutoff method
+        :param cutoff_method: How to perform binarization, either
+            "simple" for considering over expression to be any value greater than cutoff and under expression to be
+                any value below negative cutoff
+            "probability" for considering over expression to be any value in the top cutoff proportion of the data,
+                and under expression to be any value in the bottom cutoff proportion of the data
+        :param regression_metric_list list of metrics to use for regression
+        :param regression_metric_names list of the names of the regression metrics
+        :param regression_metric_kwargs list of kwarg dicts passes to the regression metrics
+        :param classification_labels_metric_list list of metrics to use for scoring classification labels
+        :param classification_labels_metric_names list of names for the metrics used for scoring classification labels
+        :param classification_labels_metric_kwargs list of kwarg dicts for the metrics used for scoring classification
+            labels
+        :param classification_decision_function_metric_list List of the metrics to use for scoring the classification
+            decision functions
+        :param classification_decision_function_metric_names List of names for the metrics used for scoring the
+            classification decision functions
+        :param classification_decision_function_metric_kwargs List of kwargs dicts for the metrics used for scoring the
+            classification decision functions
+        :return: gene_scores, overall_scores
+            Tuple of gene-by-gene scores in dataframe, and overall scores in a pandas series
         """
-        if metric_list is None:
-            metric_list = [mean_squared_error,
-                           mean_absolute_error,
-                           r2_score,
-                           median_absolute_error]
-            metric_names = ["mean_squared_error",
-                            "mean_absolute_error",
-                            "median_absolute_error",
-                            "r2_score"]
-        if len(metric_list) != len(metric_names):
-            raise ValueError("Length of metric_list and metric_names don't match")
-        scores = []
-        for metric, name in zip(metric_list, metric_names):
-            score = self.score(kinase_expression=kinase_expression,
-                               tf_expression=tf_expression,
-                               gene_expression=gene_expression,
-                               metric=metric)
-            score.name = name
-            scores.append(score)
-        oe_scores, ue_scores = self.score_classification(kinase_expression=kinase_expression,
+        # Evaluation of function arguments
+        # If there is not a provided regression metric list, create one, along with the names, and kwarg dicts
+        if not regression_metric_list:
+            regression_metric_list = [mean_squared_error,
+                                      mean_absolute_error,
+                                      median_absolute_error,
+                                      r2_score]
+            regression_metric_names = ["mean_squared_error",
+                                       "mean_absolute_error",
+                                       "median_absolute_error",
+                                       "r2"]
+            regression_metric_kwargs = [dict(), dict(), dict(), dict()]
+        # If there is provided regression metric lists, make sure it is the same length as the metric names
+        #   and ensure that if it is not none, the regression metric kwargs list is the same length as well
+        else:
+            if not regression_metric_names:
+                regression_metric_names = []
+                for i in range(len(regression_metric_list)):
+                    regression_metric_names.append(f"r_{i}")
+            else:
+                if len(regression_metric_names) != len(regression_metric_list):
+                    raise ValueError("Regression Metric List and Regression Metric Names must be the same length")
+            if not regression_metric_kwargs:
+                regression_metric_kwargs = []
+                for _ in range(len(regression_metric_list)):
+                    regression_metric_kwargs.append(dict())
+            else:
+                if len(regression_metric_kwargs) != len(regression_metric_list):
+                    raise ValueError("Regression Metric List and Regression Metric Kwargs must be the same length")
+        # Similarly for the classification label scores
+        # If classification label metrics are not provided, create list, names, and kwargs
+        if not classification_labels_metric_list:
+            classification_labels_metric_list = [
+                accuracy_score,
+                precision_score,
+                recall_score,
+                f1_score,
+                balanced_accuracy_score,
+            ]
+            classification_labels_metric_names = [
+                "accuracy",
+                "precision",
+                "recall",
+                "f1",
+                "balanced_accuracy"
+            ]
+            classification_labels_metric_kwargs = [
+                dict(),
+                dict(),
+                dict(),
+                dict(),
+                dict()
+            ]
+        else:
+            # If there is not a list of names for the metrics, create one
+            if not classification_labels_metric_names:
+                classification_labels_metric_names = []
+                for i in range(len(classification_labels_metric_list)):
+                    classification_labels_metric_names.append(f"cl_{i}")
+            # If there is a list of names, make sure it is the same length as the metric list
+            else:
+                if len(classification_labels_metric_names) != len(classification_labels_metric_list):
+                    raise ValueError("Classification Label Metric List and Classification Label Metric names must be "
+                                     "the same length")
+            # If there is not a list of kwarg dicts, create one
+            if not classification_labels_metric_kwargs:
+                classification_labels_metric_kwargs = []
+                for _ in range(len(classification_labels_metric_list)):
+                    classification_labels_metric_kwargs.append(dict())
+            # If there is, make sure it is the same length as the list of metrics
+            else:
+                if len(classification_labels_metric_kwargs) != len(classification_labels_metric_list):
+                    raise ValueError("Classification Label Metric List and Classification Label Metric Kwargs must be "
+                                     "the same length")
+        # And finally for the Classification decision function
+        # If there is not a classification decision function metric list
+        if not classification_decision_function_metric_list:
+            classification_decision_function_metric_list = [roc_auc_score]
+            classification_decision_function_metric_names = ["roc_auc_score"]
+            classification_decision_function_metric_kwargs = [dict()]
+        # If there is, check the name and kwargs arguments
+        else:
+            # If there is not a list of names, create one
+            if not classification_decision_function_metric_names:
+                classification_decision_function_metric_names = []
+                for i in range(len(classification_decision_function_metric_list)):
+                    classification_decision_function_metric_names.append(f"cf_{i}")
+            # If there is a list of names, make sure it is the same length as the metric list
+            else:
+                if (len(classification_decision_function_metric_names) !=
+                        len(classification_decision_function_metric_list)):
+                    raise ValueError("Classification decision function names must be the same length as the provided "
+                                     "metric list")
+            # If there is not a list of kwarg dicts, create one
+            if not classification_decision_function_metric_kwargs:
+                classification_decision_function_metric_kwargs = []
+                for _ in range(len(classification_decision_function_metric_list)):
+                    classification_decision_function_metric_kwargs.append(dict())
+            # If there is, check that it is the right length
+            else:
+                if (len(classification_decision_function_metric_list) !=
+                        len(classification_decision_function_metric_kwargs)):
+                    raise ValueError("Classification decision function kwarg list must be the same length as the "
+                                     "provided metric list")
+        # Now that all the metric, names, and kwarg lists have been either created or checked,
+        gene_score_list = []
+        overall_score_dict = dict()
+        for metric, kwarg_dict, name in zip(regression_metric_list, regression_metric_kwargs, regression_metric_names):
+            gene_regression_scores = self.score_gene_regression(kinase_expression=kinase_expression,
+                                                                tf_expression=tf_expression,
+                                                                gene_expression=gene_expression,
+                                                                metric=metric, **kwarg_dict)
+            gene_regression_scores.name = f"regression_{name}"
+            gene_score_list.append(gene_regression_scores)
+            overall_regression_scores = self.score_overall_regression(kinase_expression=kinase_expression,
+                                                                      tf_expression=tf_expression,
+                                                                      gene_expression=gene_expression,
+                                                                      metric=metric, **kwarg_dict)
+            overall_score_dict[f"regression_{name}"] = overall_regression_scores
+        for metric, kwarg_dict, name in zip(classification_labels_metric_list,
+                                            classification_labels_metric_kwargs,
+                                            classification_labels_metric_names):
+            gene_oe_cl_scores, gene_ue_cl_scores = \
+                self.score_gene_classification_labels(kinase_expression=kinase_expression,
+                                                      tf_expression=tf_expression,
+                                                      gene_expression=gene_expression,
+                                                      cutoff=cutoff,
+                                                      cutoff_method=cutoff_method,
+                                                      metric=metric,
+                                                      **kwarg_dict)
+            gene_oe_cl_scores.name = f"cl_{name}_oe"
+            gene_ue_cl_scores.name = f"cl_{name}_ue"
+            gene_score_list.append(gene_oe_cl_scores)
+            gene_score_list.append(gene_ue_cl_scores)
+            overall_cl_oe_score, overall_cl_ue_score = \
+                self.score_overall_classification_labels(kinase_expression=kinase_expression,
                                                          tf_expression=tf_expression,
                                                          gene_expression=gene_expression,
-                                                         cutoff=cutoff)
-        scores.append(oe_scores)
-        scores.append(ue_scores)
-        return pd.concat(scores, axis=1)
+                                                         cutoff=cutoff,
+                                                         cutoff_method=cutoff_method,
+                                                         metric=metric,
+                                                         **kwarg_dict)
+            overall_score_dict[f"cl_{name}_oe"] = overall_cl_oe_score
+            overall_score_dict[f"cl_{name}_ue"] = overall_cl_ue_score
+        for metric, kwarg_dict, name in zip(classification_decision_function_metric_list,
+                                            classification_decision_function_metric_kwargs,
+                                            classification_decision_function_metric_names):
+            gene_oe_cf_scores, gene_ue_cf_scores = \
+                self.score_gene_classification_decision_function(kinase_expression=kinase_expression,
+                                                                 tf_expression=tf_expression,
+                                                                 gene_expression=gene_expression,
+                                                                 cutoff=cutoff,
+                                                                 cutoff_method=cutoff_method,
+                                                                 metric=metric,
+                                                                 **kwarg_dict)
+            gene_oe_cf_scores.name = f"cf_{name}_oe"
+            gene_ue_cf_scores.name = f"cf_{name}_ue"
+            gene_score_list.append(gene_oe_cf_scores)
+            gene_score_list.append(gene_ue_cf_scores)
+            overall_cf_oe_score, overall_cf_ue_score = \
+                self.score_overall_classification_decision_function(kinase_expression=kinase_expression,
+                                                                    tf_expression=tf_expression,
+                                                                    gene_expression=gene_expression,
+                                                                    cutoff=cutoff,
+                                                                    cutoff_method=cutoff_method,
+                                                                    metric=metric,
+                                                                    **kwarg_dict)
+            overall_score_dict[f"cf_{name}_oe"] = overall_cf_oe_score
+            overall_score_dict[f"cf_{name}_ue"] = overall_cf_ue_score
+        # Combine the gene scores into a dataframe, and create a series from the overall scores, then return these
+        gene_scores = pd.concat(gene_score_list, axis=1)
+        overall_scores = pd.Series(overall_score_dict)
+        return gene_scores, overall_scores
 
     def find_interaction_terms_initial(self, gene):
         """
@@ -639,8 +1139,9 @@ class KinaseTfModel:
                 all_interaction_terms_list.append(f"{kinase}_{tf}")
         self.model_coefficients = pd.DataFrame(data=0.,
                                                index=self.targeted_genes,
-                                               columns=list(self.tf_dict.keys()) + list(self.kinase_dict.keys()) +
-                                                       all_interaction_terms_list)
+                                               columns=list(self.tf_dict.keys()) +
+                                               list(self.kinase_dict.keys()) +
+                                               all_interaction_terms_list)
         if intercept:
             self.model_coefficients["intercept"] = 0.0
         for gene in self.targeted_genes:
@@ -783,25 +1284,3 @@ class KinaseTfModel:
         cyto_network = nx.cytoscape_data(network, name="name", ident="id")
         with open(outfile, "w") as f:
             json.dump(cyto_network, f)
-
-    @staticmethod
-    def compute_probabilities(data: pd.Series, direction: str = "over") -> pd.Series:
-        """
-        Function to compute probabilities from regression output
-        :param data: Data to convert
-        :param direction: Which direction the integral should be computed for the CDF,
-            Starting from -inf: [over, left, l] (case insensitive)
-            Going to -inf: [under, right, r] (case insensitive)
-        :return: probabilities
-            Pandas series of the probabilities, same shape as data
-        """
-        dist = gaussian_kde(data)
-        probabilities = pd.Series(0, index=data.index)
-        for sample in data.index:
-            if direction.upper() in ["OVER", "LEFT", "L"]:
-                probabilities[sample] = dist.integrate_box_1d(-np.inf, data[sample])
-            elif direction.upper() in ["UNDER", "RIGHT", "R", "DOWN", "KO"]:
-                probabilities[sample] = dist.integrate_box_1d(data[sample], np.inf)
-            else:
-                raise ValueError("Couldn't interpret direction")
-        return probabilities

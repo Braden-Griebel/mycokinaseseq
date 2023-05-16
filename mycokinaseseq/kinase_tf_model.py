@@ -218,8 +218,16 @@ class KinaseTfModel:
         self.targeted_genes = []
         for key, item in self.gene_to_tf_to_kinase_dict.items():
             if item:
-                if (key not in list(self.tf_dict.keys())) and (key not in list(self.kinase_dict.keys())):
-                    self.targeted_genes.append(key)
+                self.targeted_genes.append(key)
+        # Remove tfs, and kinases from dicts that will lead to them targeting themselves
+        for gene, tf_list in self.gene_to_tf_dict.items():
+            if gene in tf_list:
+                tf_list.remove(gene)
+                self.gene_to_tf_dict[gene] = tf_list
+        for gene, kinase_list in self.gene_to_tf_to_kinase_dict.items():
+            if gene in kinase_list:
+                kinase_list.remove(gene)
+                self.gene_to_tf_to_kinase_dict[gene] = kinase_list
         # Lists of TFs and Kinases
         self.tf_list = list(tf_dict.keys())
         self.kinase_list = list(kinase_dict.keys())
@@ -377,6 +385,7 @@ class KinaseTfModel:
         gene_expression, predicted = self._setup_score_functions(kinase_expression=kinase_expression,
                                                                  tf_expression=tf_expression,
                                                                  gene_expression=gene_expression)
+        print(f"Predicted Dataframe: \n{predicted}")
         regression_gene_scores = df_reduce(gene_expression, predicted, metric, axis=1, **kwargs)
         return regression_gene_scores
 
@@ -937,10 +946,15 @@ class KinaseTfModel:
         # Create a list of tuples with (kinase, tf) where the kinase targets the TF, and the TF targets the genes
         interaction_terms = []
         for tf in tfs:
+            # If the tf is the gene in questions, skip this iteration
+            if tf == gene:
+                continue
             # Check if there are kinases which target this tf
             if self.tf_kinase_dict[tf]:
                 # Add interaction terms to list
                 for kinase in self.tf_kinase_dict[tf]:
+                    if kinase == gene:
+                        continue
                     interaction_terms.append((kinase, tf))
             else:
                 continue
@@ -988,6 +1002,10 @@ class KinaseTfModel:
             kinases = self.gene_to_tf_to_kinase_dict[gene]
         else:
             kinases = []
+        if gene in tfs:
+            tfs.remove(gene)
+        if gene in kinases:
+            kinases.remove(gene)
         # Create the exogenous array with the transcription factors and kinases
         term_list = tfs + kinases + interaction_terms
         if intercept:
@@ -1465,7 +1483,10 @@ class TfOnlyModel:
         :return: exog_array
             The exogenous array for gene
         """
-        exog_array = data[self.gene_to_tf_dict[gene]].copy()
+        tf_list = self.gene_to_tf_dict[gene]
+        if gene in tf_list:
+            tf_list.remove(gene)
+        exog_array = data[tf_list].copy()
         if intercept:
             exog_array["intercept"] = 1.
         return exog_array
@@ -1668,6 +1689,10 @@ class TfKinaseRestrictedModel:
         # Find which tfs and kinases should be included in the model
         tfs = self.gene_to_tf_dict[gene]
         kinases = self.gene_to_tf_to_kinase_dict[gene]
+        if gene in tfs:
+            tfs.remove(gene)
+        if gene in kinases:
+            kinases.remove(gene)
         # Create the exogenous array
         exog = data[tfs + kinases].copy()
         # If an intercept is needed, add a column of all 1s
@@ -1888,8 +1913,14 @@ class TfKinaseFullModel:
         :return: exog
             The exogenous array, a pandas dataframe
         """
+        tf_list = self.gene_to_tf_dict[gene]
+        if gene in tf_list:
+            tf_list.remove(gene)
+        kinase_list = self.gene_to_tf_to_kinase_dict[gene]
+        if gene in kinase_list:
+            kinase_list.remove(gene)
         # Create a list of columns for the exogenous array
-        exog_columns = self.gene_to_tf_dict[gene] + self.gene_to_tf_to_kinase_dict[gene]
+        exog_columns = tf_list + kinase_list
         # Find the interaction terms which need to be added,
         interaction_terms = self.find_interaction_terms(gene)
         # Iterate through the interaction terms, and add them to the columns list
@@ -1914,7 +1945,11 @@ class TfKinaseFullModel:
         tfs = self.gene_to_tf_dict[gene]
         # for each tf, find the kinases that target them, and add interaction terms tuple to the list
         for tf in tfs:
+            if tf == gene:
+                continue
             kinases = self.gene_to_kinase_dict[tf]
             for kinase in kinases:
+                if kinase == gene:
+                    continue
                 interaction_terms_list.append((kinase, tf))
         return interaction_terms_list

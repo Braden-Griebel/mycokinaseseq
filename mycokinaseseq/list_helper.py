@@ -24,3 +24,17 @@ def find_intersect(list1: list, list2: list) -> list:
     :return: List with the elements found in both lists
     """
     return [value for value in list1 if value in list2]
+
+
+def list_contains_duplicate(list1: list) -> bool:
+    """
+    Determing if the list contains duplicate items
+    :param list1: List to check duplicates for
+    :return: duplicates
+        Bool, True if there are duplicates
+    """
+    # Check if the length of unique elements is the same as the length of the original list
+    if len(list1) != len(list(np.unique(list1))):
+        # If it isn't there is a duplicate
+        return True
+    return False

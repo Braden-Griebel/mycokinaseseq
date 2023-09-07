@@ -13,6 +13,7 @@ from scipy.stats import gaussian_kde
 from sklearn.metrics import mean_squared_error, \
     mean_absolute_error, r2_score, median_absolute_error, \
     roc_auc_score, balanced_accuracy_score, f1_score, precision_score, recall_score, accuracy_score
+from sklearn.metrics._classification import UndefinedMetricWarning
 
 # Local Imports
 import mycokinaseseq.list_helper as lh
@@ -107,6 +108,38 @@ def compute_probabilities(data: pd.Series, direction: str = "over") -> pd.Series
     return probabilities
 
 
+def df_check_index_equality(df1, df2):
+    """
+    Check if the provided dataframes have the same entries in their index, and columns regardless of order
+        Will raise error if there are any duplicate entries
+    :param df1: First dataframe
+    :param df2: Second Dataframe
+    :return: equal
+        A boolean indicating if the indices are equal
+    """
+    # Convert the index objects to lists
+    df1_index_list = list(df1.index)
+    df2_index_list = list(df2.index)
+    df1_column_list = list(df1.columns)
+    df2_column_list = list(df2.columns)
+    # Check uniqueness of elements in the lists
+    if lh.list_contains_duplicate(df1_index_list):
+        raise ValueError("df1 index Contains Duplicate Values")
+    if lh.list_contains_duplicate(df2_index_list):
+        raise ValueError("df2 index Contains Duplicate Values")
+    if lh.list_contains_duplicate(df1_column_list):
+        raise ValueError("df1 columns Contain Duplicate Values")
+    if lh.list_contains_duplicate(df2_column_list):
+        raise ValueError("df2 columns Contain Duplicate Values")
+    # Since there are no duplicates, set operations can be used
+    if set(df1_index_list) != set(df2_index_list):
+        return False
+    if set(df1_column_list) != set(df2_column_list):
+        return False
+    # If checks are passed, then the indexes are equal
+    return True
+
+
 def df_reduce(df1, df2, func: typing.Callable, axis: int = 1, **kwargs):
     """
     Function to take two dataframes, and reduce them
@@ -117,25 +150,43 @@ def df_reduce(df1, df2, func: typing.Callable, axis: int = 1, **kwargs):
     :return: reduced
         pandas series containing the value for each row or column (depending on axis argument)
     """
-    # Make sure the index and columns are equal
-    if not df1.index.equals(df2):
-        raise ValueError("Indices are not equal")
-    if not df1.columns.equals(df2):
-        raise ValueError("Columns are not equal")
+    # Set warnings to be handled as errors to allow for exception handling
+    warnings.filterwarnings("error")
+    df1 = df1.loc[df2.index, df2.columns]
+    # Make sure the index and columns contain the same entries
+    if not df_check_index_equality(df1, df2):
+        raise ValueError(f"Indices are not equal")
+    # Even though the indices contain the same elements, they are not necessarily in the same order,
+    #   reorder the second dataframe to match the first
+    df2 = df2.loc[df1.index, df1.columns]
     # If the axis is 0, then iterate through the rows, combining each using the provided function
     if axis == 0:
         reduced = pd.Series(None, index=df1.index, dtype="Float64")
         for row in df1.index:
-            # TODO: Add Try Except to catch issues if no examples of one label are present
-            reduced[row] = func(df1.loc[row], df2.loc[row])
+            try:
+                reduced[row] = func(df1.loc[row], df2.loc[row], **kwargs)
+            except ValueError:
+                reduced[row] = np.NAN
+            except UndefinedMetricWarning:
+                reduced[row] = np.NAN
+            except UserWarning:
+                reduced[row] = np.NAN
+
     # If the axis is 1, then iterate through the columns, combining each using the provided function
     elif axis == 1:
         reduced = pd.Series(None, index=df1.columns, dtype="Float64")
         for col in df1.columns:
-            # TODO: Add Try Except to catch issues if no examples of one label are present
-            reduced[col] = func(df1[col], df2[col], **kwargs)
+            try:
+                reduced[col] = func(df1[col], df2[col], **kwargs)
+            except ValueError:
+                reduced[col] = np.NAN
+            except UndefinedMetricWarning:
+                reduced[col] = np.NAN
+            except UserWarning:
+                reduced[col] = np.NAN
     else:
         reduced = None
+    warnings.resetwarnings()
     return reduced
 
 
@@ -144,7 +195,7 @@ def df_reduce(df1, df2, func: typing.Callable, axis: int = 1, **kwargs):
 # and transcription factor information
 # The data will not be scaled
 
-class KinaseTfModel:
+class RegressionBase:
     def __init__(self, kinase_dict: dict, tf_dict: dict, gene_list: list):
         """
         Initiation Method
@@ -229,8 +280,8 @@ class KinaseTfModel:
                 kinase_list.remove(gene)
                 self.gene_to_tf_to_kinase_dict[gene] = kinase_list
         # Lists of TFs and Kinases
-        self.tf_list = list(tf_dict.keys())
-        self.kinase_list = list(kinase_dict.keys())
+        self.tf_list = list(self.tf_dict.keys())
+        self.kinase_list = list(self.kinase_dict.keys())
         # Array to hold the model coefficients which will be determined during fitting
         self.model_coefficients = None
         # Array to hold the associations, again determined during fitting
@@ -241,6 +292,18 @@ class KinaseTfModel:
         self.intercept = None
         # Variable for if the model is regularized
         self.regularized = None
+
+
+class KinaseTfModel(RegressionBase):
+    def __init__(self, kinase_dict: dict, tf_dict: dict, gene_list: list):
+        """
+        Initiation Method
+        :param kinase_dict: Dictionary of kinase: gene-targets
+        :param tf_dict: Dictionary of tf: gene-targets
+        :param gene_list: List of all genes in the compendia
+        """
+        # Call regression base init
+        super().__init__(kinase_dict, tf_dict, gene_list)
 
     def fit(self, compendia: pd.DataFrame,
             significance_level: float = 0.05,
@@ -385,7 +448,6 @@ class KinaseTfModel:
         gene_expression, predicted = self._setup_score_functions(kinase_expression=kinase_expression,
                                                                  tf_expression=tf_expression,
                                                                  gene_expression=gene_expression)
-        print(f"Predicted Dataframe: \n{predicted}")
         regression_gene_scores = df_reduce(gene_expression, predicted, metric, axis=1, **kwargs)
         return regression_gene_scores
 
@@ -1298,91 +1360,16 @@ class KinaseTfModel:
             json.dump(cyto_network, f)
 
 
-class TfOnlyModel:
+class TfOnlyModel(RegressionBase):
     def __init__(self, kinase_dict: dict, tf_dict: dict, gene_list: list):
         """
-        init Function for TF Only Model
-        :param kinase_dict: dict of kinase:gene showing the phosphorylation targets
-        :param tf_dict: dict of tf:gene showing tf targets
-        :param gene_list: Total list of genes which will be in the compendia
+        Initiation Method
+        :param kinase_dict: Dictionary of kinase: gene-targets
+        :param tf_dict: Dictionary of tf: gene-targets
+        :param gene_list: List of all genes in the compendia
         """
-        # Create a list of genes
-        self.gene_list = gene_list
-        # Remove any genes not in gene_list from both of the dictionaries
-        filtered_kinase_dict = {}
-        filtered_tf_dict = {}
-        for kinase, gene_list in kinase_dict.items():
-            if kinase not in self.gene_list:
-                continue
-            filtered_genes = [gene for gene in gene_list if gene in self.gene_list]
-            filtered_kinase_dict[kinase] = filtered_genes
-        for tf, gene_list in tf_dict.items():
-            if tf not in self.gene_list:
-                continue
-            filtered_genes = [gene for gene in gene_list if gene in self.gene_list]
-            filtered_tf_dict[tf] = filtered_genes
-        # Create variables to store the kinase and TF dicts
-        self.kinase_dict = filtered_kinase_dict
-        self.tf_dict = filtered_tf_dict
-
-        # Create dictionary of tf:kinase
-        self.tf_kinase_dict = {}
-        # Iterate through the transcription factors
-        for tf in self.tf_dict.keys():
-            kinase_list = []
-            # Iterate through the kinases
-            for kinase in self.kinase_dict.keys():
-                # If the tf is targeted by the kinase, add it to the
-                if tf in self.kinase_dict[kinase]:
-                    kinase_list.append(kinase)
-            self.tf_kinase_dict[tf] = lh.get_unique_list(kinase_list)
-        # Create dictionaries to hold information about TF and Kinase targets, keyed by gene
-        self.gene_to_kinase_dict = {}  # gene: kinase which directly targets that gene
-        self.gene_to_tf_dict = {}  # gene: tf which directly targets that gene
-        self.gene_to_tf_to_kinase_dict = {}  # gene: kinase which targets that gene through tf
-        # Iterate through the genes to construct the dictionaries
-        for gene in self.gene_list:
-            kinase_list = []
-            tf_list = []
-            tf_kinase_list = []
-            for kinase in self.kinase_dict.keys():
-                if gene in self.kinase_dict[kinase]:
-                    kinase_list.append(kinase)
-            for tf in self.tf_dict.keys():
-                if gene in self.tf_dict[tf]:
-                    tf_list.append(tf)
-                    tf_kinase_list += self.tf_kinase_dict[tf]
-            self.gene_to_tf_dict[gene] = lh.get_unique_list(tf_list)
-            self.gene_to_kinase_dict[gene] = lh.get_unique_list(kinase_list)
-            self.gene_to_tf_to_kinase_dict[gene] = lh.get_unique_list(tf_kinase_list)
-        # Create lists of genes targeted by TFs, targeted by TFs targeted by kinases, and targeted by kinases
-        self.genes_targeted_by_tf = []
-        self.genes_targeted_by_kinase = []
-        self.genes_targeted_by_tf_targeted_by_kinase = []
-        # Iterate through the genes
-        for gene in self.gene_list:
-            # If the gene is targeted by TFs,
-            if self.gene_to_tf_dict[gene]:
-                self.genes_targeted_by_tf += self.gene_to_tf_dict[gene]
-            if self.gene_to_kinase_dict[gene]:
-                self.genes_targeted_by_kinase += self.gene_to_kinase_dict[gene]
-            if self.gene_to_tf_to_kinase_dict[gene]:
-                self.genes_targeted_by_tf_targeted_by_kinase += self.gene_to_tf_to_kinase_dict[gene]
-        # Create a list of all the genes which are targeted by at least one tf, which is targeted by a kinase
-        self.targeted_genes = []
-        for key, item in self.gene_to_tf_to_kinase_dict.items():
-            if item:
-                if (key not in list(self.tf_dict.keys())) and (key not in list(self.kinase_dict.keys())):
-                    self.targeted_genes.append(key)
-        # Lists of TFs and Kinases
-        self.tf_list = list(tf_dict.keys())
-        self.kinase_list = list(kinase_dict.keys())
-        # Array to hold the model coefficients which will be determined during fitting
-        self.model_coefficients = None
-        # Variable for if the models have intercepts
-        self.intercept = None
-        # Variable for if the model is regularized
-        self.regularized = None
+        # Call regression base init
+        super().__init__(kinase_dict, tf_dict, gene_list)
 
     def fit(self, data: pd.DataFrame, regularized: bool, intercept: bool = True, verbose: bool = False, **kwargs):
         """
@@ -1446,6 +1433,9 @@ class TfOnlyModel:
         :return: pred_gene_expression
             Dataframe with predicted gene expression, dimensions are (n_samples, n_genes)
         """
+        # If there should be an intercept, add it to the input dataframe
+        if self.intercept:
+            tf_expression["intercept"] = 1.
         input_df = tf_expression[self.model_coefficients.columns]
         output = pd.DataFrame(
             np.transpose(
@@ -1456,9 +1446,11 @@ class TfOnlyModel:
         )
         return output
 
-    def score(self, tf_expression: pd.DataFrame, gene_expression: pd.DataFrame, metric: typing.Callable):
+    def score(self, tf_expression: pd.DataFrame, gene_expression: pd.DataFrame, metric: typing.Callable,
+              kinase_expression=None):
         """
         Method to score the model against the provided gene_expression values
+        :param kinase_expression: Dummy variable to make method match other models
         :param tf_expression: TF expression dataframe, dimensions are (n_samples, n_tfs)
         :param gene_expression: Gene expression dataframe, dimensions are (n_samples, n_genes)
         :param metric: Metric to use for scoring, should take two pandas series and return a value (Float64)
@@ -1467,7 +1459,6 @@ class TfOnlyModel:
         """
         # get prediction of gene expression
         predicted = self.predict(tf_expression=tf_expression)
-        print(f"Predicted: \n{predicted}")
         # Make sure prediction and gene expression have the same index and columns
         predicted = predicted.loc[gene_expression.index, gene_expression.columns]
         # Score the models using the provided metric
@@ -1492,91 +1483,16 @@ class TfOnlyModel:
         return exog_array
 
 
-class TfKinaseRestrictedModel:
+class TfKinaseRestrictedModel(RegressionBase):
     def __init__(self, kinase_dict: dict, tf_dict: dict, gene_list: list):
         """
-        init Function for TF Only Model
-        :param kinase_dict: dict of kinase:gene showing the phosphorylation targets
-        :param tf_dict: dict of tf:gene showing tf targets
-        :param gene_list: Total list of genes which will be in the compendia
+        Initiation Method
+        :param kinase_dict: Dictionary of kinase: gene-targets
+        :param tf_dict: Dictionary of tf: gene-targets
+        :param gene_list: List of all genes in the compendia
         """
-        # Create a list of genes
-        self.gene_list = gene_list
-        # Remove any genes not in gene_list from both of the dictionaries
-        filtered_kinase_dict = {}
-        filtered_tf_dict = {}
-        for kinase, gene_list in kinase_dict.items():
-            if kinase not in self.gene_list:
-                continue
-            filtered_genes = [gene for gene in gene_list if gene in self.gene_list]
-            filtered_kinase_dict[kinase] = filtered_genes
-        for tf, gene_list in tf_dict.items():
-            if tf not in self.gene_list:
-                continue
-            filtered_genes = [gene for gene in gene_list if gene in self.gene_list]
-            filtered_tf_dict[tf] = filtered_genes
-        # Create variables to store the kinase and TF dicts
-        self.kinase_dict = filtered_kinase_dict
-        self.tf_dict = filtered_tf_dict
-
-        # Create dictionary of tf:kinase
-        self.tf_kinase_dict = {}
-        # Iterate through the transcription factors
-        for tf in self.tf_dict.keys():
-            kinase_list = []
-            # Iterate through the kinases
-            for kinase in self.kinase_dict.keys():
-                # If the tf is targeted by the kinase, add it to the
-                if tf in self.kinase_dict[kinase]:
-                    kinase_list.append(kinase)
-            self.tf_kinase_dict[tf] = lh.get_unique_list(kinase_list)
-        # Create dictionaries to hold information about TF and Kinase targets, keyed by gene
-        self.gene_to_kinase_dict = {}  # gene: kinase which directly targets that gene
-        self.gene_to_tf_dict = {}  # gene: tf which directly targets that gene
-        self.gene_to_tf_to_kinase_dict = {}  # gene: kinase which targets that gene through tf
-        # Iterate through the genes to construct the dictionaries
-        for gene in self.gene_list:
-            kinase_list = []
-            tf_list = []
-            tf_kinase_list = []
-            for kinase in self.kinase_dict.keys():
-                if gene in self.kinase_dict[kinase]:
-                    kinase_list.append(kinase)
-            for tf in self.tf_dict.keys():
-                if gene in self.tf_dict[tf]:
-                    tf_list.append(tf)
-                    tf_kinase_list += self.tf_kinase_dict[tf]
-            self.gene_to_tf_dict[gene] = lh.get_unique_list(tf_list)
-            self.gene_to_kinase_dict[gene] = lh.get_unique_list(kinase_list)
-            self.gene_to_tf_to_kinase_dict[gene] = lh.get_unique_list(tf_kinase_list)
-        # Create lists of genes targeted by TFs, targeted by TFs targeted by kinases, and targeted by kinases
-        self.genes_targeted_by_tf = []
-        self.genes_targeted_by_kinase = []
-        self.genes_targeted_by_tf_targeted_by_kinase = []
-        # Iterate through the genes
-        for gene in self.gene_list:
-            # If the gene is targeted by TFs,
-            if self.gene_to_tf_dict[gene]:
-                self.genes_targeted_by_tf += self.gene_to_tf_dict[gene]
-            if self.gene_to_kinase_dict[gene]:
-                self.genes_targeted_by_kinase += self.gene_to_kinase_dict[gene]
-            if self.gene_to_tf_to_kinase_dict[gene]:
-                self.genes_targeted_by_tf_targeted_by_kinase += self.gene_to_tf_to_kinase_dict[gene]
-        # Create a list of all the genes which are targeted by at least one tf, which is targeted by a kinase
-        self.targeted_genes = []
-        for key, item in self.gene_to_tf_to_kinase_dict.items():
-            if item:
-                if (key not in list(self.tf_dict.keys())) and (key not in list(self.kinase_dict.keys())):
-                    self.targeted_genes.append(key)
-        # Lists of TFs and Kinases
-        self.tf_list = list(tf_dict.keys())
-        self.kinase_list = list(kinase_dict.keys())
-        # Array to hold the model coefficients which will be determined during fitting
-        self.model_coefficients = None
-        # Variable for if the models have intercepts
-        self.intercept = None
-        # Variable for if the model is regularized
-        self.regularized = None
+        # Call regression base init
+        super().__init__(kinase_dict, tf_dict, gene_list)
 
     def fit(self, data: pd.DataFrame, regularized: bool, intercept: bool = True, verbose: bool = False, **kwargs):
         """
@@ -1645,11 +1561,13 @@ class TfKinaseRestrictedModel:
             Dataframe with predicted gene expression, dimensions are (n_samples, n_genes)
         """
         expression = pd.concat([tf_expression, kinase_expression], axis=1)
+        if self.intercept:
+            expression["intercept"] = 1.
         input_df = expression[self.model_coefficients.columns]
         output = pd.DataFrame(
             np.transpose(
                 np.matmul(self.model_coefficients.to_numpy(),
-                          np.transcpose(input_df.fillna(0).to_numpy())
+                          np.transpose(input_df.fillna(0).to_numpy())
                           )
             ), index=expression.index, columns=self.model_coefficients.index
         )
@@ -1671,7 +1589,6 @@ class TfKinaseRestrictedModel:
         """
         # get prediction of gene expression
         predicted = self.predict(tf_expression=tf_expression, kinase_expression=kinase_expression)
-        print(f"Predicted: \n{predicted}")
         # Make sure prediction and gene expression have the same index and columns
         predicted = predicted.loc[gene_expression.index, gene_expression.columns]
         # Score the models using the provided metric
@@ -1702,7 +1619,7 @@ class TfKinaseRestrictedModel:
         return exog
 
 
-class TfKinaseFullModel:
+class TfKinaseFullModel(RegressionBase):
     def __init__(self, kinase_dict: dict, tf_dict: dict, gene_list: list):
         """
         Initiation Method
@@ -1710,87 +1627,8 @@ class TfKinaseFullModel:
         :param tf_dict: Dictionary of tf: gene-targets
         :param gene_list: List of all genes in the compendia
         """
-        # Create a list of genes
-        self.gene_list = gene_list
-        # Remove any genes not in gene_list from both of the dictionaries
-        filtered_kinase_dict = {}
-        filtered_tf_dict = {}
-        for kinase, gene_list in kinase_dict.items():
-            if kinase not in self.gene_list:
-                continue
-            filtered_genes = [gene for gene in gene_list if gene in self.gene_list]
-            filtered_kinase_dict[kinase] = filtered_genes
-        for tf, gene_list in tf_dict.items():
-            if tf not in self.gene_list:
-                continue
-            filtered_genes = [gene for gene in gene_list if gene in self.gene_list]
-            filtered_tf_dict[tf] = filtered_genes
-        # Create variables to store the kinase and TF dicts
-        self.kinase_dict = filtered_kinase_dict
-        self.tf_dict = filtered_tf_dict
-
-        # Create dictionary of tf:kinase
-        self.tf_kinase_dict = {}
-        # Iterate through the transcription factors
-        for tf in self.tf_dict.keys():
-            kinase_list = []
-            # Iterate through the kinases
-            for kinase in self.kinase_dict.keys():
-                # If the tf is targeted by the kinase, add it to the
-                if tf in self.kinase_dict[kinase]:
-                    kinase_list.append(kinase)
-            self.tf_kinase_dict[tf] = lh.get_unique_list(kinase_list)
-        # Create dictionaries to hold information about TF and Kinase targets, keyed by gene
-        self.gene_to_kinase_dict = {}  # gene: kinase which directly targets that gene
-        self.gene_to_tf_dict = {}  # gene: tf which directly targets that gene
-        self.gene_to_tf_to_kinase_dict = {}  # gene: kinase which targets that gene through tf
-        # Iterate through the genes to construct the dictionaries
-        for gene in self.gene_list:
-            kinase_list = []
-            tf_list = []
-            tf_kinase_list = []
-            for kinase in self.kinase_dict.keys():
-                if gene in self.kinase_dict[kinase]:
-                    kinase_list.append(kinase)
-            for tf in self.tf_dict.keys():
-                if gene in self.tf_dict[tf]:
-                    tf_list.append(tf)
-                    tf_kinase_list += self.tf_kinase_dict[tf]
-            self.gene_to_tf_dict[gene] = lh.get_unique_list(tf_list)
-            self.gene_to_kinase_dict[gene] = lh.get_unique_list(kinase_list)
-            self.gene_to_tf_to_kinase_dict[gene] = lh.get_unique_list(tf_kinase_list)
-        # Create lists of genes targeted by TFs, targeted by TFs targeted by kinases, and targeted by kinases
-        self.genes_targeted_by_tf = []
-        self.genes_targeted_by_kinase = []
-        self.genes_targeted_by_tf_targeted_by_kinase = []
-        # Iterate through the genes
-        for gene in self.gene_list:
-            # If the gene is targeted by TFs,
-            if self.gene_to_tf_dict[gene]:
-                self.genes_targeted_by_tf += self.gene_to_tf_dict[gene]
-            if self.gene_to_kinase_dict[gene]:
-                self.genes_targeted_by_kinase += self.gene_to_kinase_dict[gene]
-            if self.gene_to_tf_to_kinase_dict[gene]:
-                self.genes_targeted_by_tf_targeted_by_kinase += self.gene_to_tf_to_kinase_dict[gene]
-        # Create a list of all the genes which are targeted by at least one tf, which is targeted by a kinase
-        self.targeted_genes = []
-        for key, item in self.gene_to_tf_to_kinase_dict.items():
-            if item:
-                if (key not in list(self.tf_dict.keys())) and (key not in list(self.kinase_dict.keys())):
-                    self.targeted_genes.append(key)
-        # Lists of TFs and Kinases
-        self.tf_list = list(tf_dict.keys())
-        self.kinase_list = list(kinase_dict.keys())
-        # Array to hold the model coefficients which will be determined during fitting
-        self.model_coefficients = None
-        # Array to hold the associations, again determined during fitting
-        self.associations = None
-        # Array to hold the significant associations, determined during fitting
-        self.significant_associations = None
-        # Variable for if the models have intercepts
-        self.intercept = None
-        # Variable for if the model is regularized
-        self.regularized = None
+        # Call regression base init
+        super().__init__(kinase_dict, tf_dict, gene_list)
 
     def fit(self, data: pd.DataFrame, regularized: bool, intercept: bool = True, verbose: bool = False, **kwargs):
         """
@@ -1869,14 +1707,20 @@ class TfKinaseFullModel:
             Dataframe with predicted gene expression, dimensions are (n_samples, n_genes)
         """
         expression = pd.concat([tf_expression, kinase_expression], axis=1)
+        expression_dict = {}
         for tf in self.tf_list:
             for kinase in self.gene_to_kinase_dict[tf]:
-                expression[f"{kinase}_{tf}"] = expression[kinase] * expression[tf]
+                # TODO: Modify to stop fragmentation
+                expression_dict[f"{kinase}_{tf}"] = expression[kinase] * expression[tf]
+        interaction_terms_df = pd.DataFrame(expression_dict)
+        expression = pd.concat([expression, interaction_terms_df], axis=1)
+        if self.intercept:
+            expression["intercept"]=1.
         input_df = expression[self.model_coefficients.columns]
         output = pd.DataFrame(
             np.transpose(
                 np.matmul(self.model_coefficients.to_numpy(),
-                          np.transcpose(input_df.fillna(0).to_numpy())
+                          np.transpose(input_df.fillna(0).to_numpy())
                           )
             ), index=expression.index, columns=self.model_coefficients.index
         )
@@ -1898,7 +1742,6 @@ class TfKinaseFullModel:
         """
         # get prediction of gene expression
         predicted = self.predict(tf_expression=tf_expression, kinase_expression=kinase_expression)
-        print(f"Predicted: \n{predicted}")
         # Make sure prediction and gene expression have the same index and columns
         predicted = predicted.loc[gene_expression.index, gene_expression.columns]
         # Score the models using the provided metric
